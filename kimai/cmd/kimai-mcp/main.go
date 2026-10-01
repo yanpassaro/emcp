@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,20 +15,25 @@ import (
 	"ntdsk.com/kimai/internal/mcpserver"
 )
 
+const DEFAULT_TIMEOUT = 30 * time.Second
+
 func main() {
 	setupLog("kimai")
 	log.Println("Kimai MCP Server iniciado (stdio).")
 
 	baseURL := strings.TrimSpace(os.Getenv("KIMAI_URL"))
 	token := strings.TrimSpace(os.Getenv("KIMAI_TOKEN"))
-	if baseURL == "" || token == "" {
-		log.Fatal("Configure as variáveis de ambiente KIMAI_URL e KIMAI_TOKEN (ex.: KIMAI_URL=https://kimai.exemplo.com KIMAI_TOKEN=seu-token)")
+	if baseURL == "" {
+		log.Fatal("Configure a variável de ambiente KIMAI_URL (ex.: KIMAI_URL=https://kimai.exemplo.com)")
+	}
+	if token == "" {
+		log.Fatal("Configure a variável de ambiente KIMAI_TOKEN")
 	}
 
 	client, err := kimai.NewClient(kimai.Config{
 		BaseURL:    baseURL,
 		Token:      token,
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{Timeout: DEFAULT_TIMEOUT},
 	})
 	if err != nil {
 		log.Fatalf("Falha ao criar cliente Kimai: %v", err)
@@ -44,22 +50,34 @@ func main() {
 func setupLog(server string) {
 	baseDir := filepath.Join(userLocalDir(), "mcp", server)
 	logDir := filepath.Join(baseDir, "logs")
-	os.MkdirAll(logDir, 0o755)
-	logPath := filepath.Join(logDir, server+"-"+time.Now().Format("2006-01-02_15-04-05")+".log")
-	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-		log.SetOutput(f)
-	} else {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		log.SetOutput(os.Stderr)
+		log.Printf("Aviso: não foi possível criar diretório de log em %s: %v", logDir, err)
+		return
+	}
+
+	name := fmt.Sprintf("%s-%s.log", server, time.Now().Format("2006-01-02_15-04-05"))
+	logPath := filepath.Join(logDir, name)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
 		log.SetOutput(os.Stderr)
 		log.Printf("Aviso: não foi possível criar log em %s: %v", logPath, err)
+		return
 	}
+
+	log.SetOutput(f)
 }
 
 func userLocalDir() string {
-	if home := os.Getenv("USERPROFILE"); home != "" {
+	home := os.Getenv("USERPROFILE")
+	if home != "" {
 		return filepath.Join(home, ".local", "share")
 	}
-	if home := os.Getenv("HOME"); home != "" {
+
+	home = os.Getenv("HOME")
+	if home != "" {
 		return filepath.Join(home, ".local", "share")
 	}
+
 	return "."
 }

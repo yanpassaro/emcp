@@ -13,6 +13,16 @@ import (
 	"ntdsk.com/gitlab/internal/gitlab"
 )
 
+const (
+	MAX_FILE_BYTES     = 200 * 1024
+	MAX_PER_PAGE       = 100
+	DEFAULT_PER_PAGE   = 50
+	MAX_TREE_ITEMS     = 1000
+	KILOBYTE           = 1024
+	MEGABYTE           = 1024 * 1024
+	FILE_TRUNCATED_MSG = " (truncado em 200KB)"
+)
+
 type Server struct {
 	client *gitlab.Client
 }
@@ -50,85 +60,188 @@ type GetFileInput struct {
 	Ref       string `json:"ref,omitempty" jsonschema:"Branch/tag/commit (default: default branch)"`
 }
 
-const maxFileBytes = 200 * 1024
+func validID(p *int) bool {
+	if p == nil {
+		return false
+	}
+	return *p > 0
+}
+
+func requireProjectID(p *int) error {
+	if validID(p) {
+		return nil
+	}
+	return errors.New("project_id é obrigatório")
+}
+
+func optionalID(query url.Values, key string, p *int) {
+	if validID(p) {
+		query.Set(key, strconv.Itoa(*p))
+	}
+}
+
+func setOrder(query url.Values, orderBy, sort string) {
+	if orderBy == "" {
+		return
+	}
+	query.Set("order_by", orderBy)
+	query.Set("sort", sort)
+}
+
+func setText(query url.Values, key, value string) {
+	if value == "" {
+		return
+	}
+	query.Set(key, value)
+}
+
+func scopedEndpoint(fallback, projectPath, groupPath string, projectID, groupID *int) string {
+	if validID(projectID) {
+		return fmt.Sprintf(projectPath, *projectID)
+	}
+	if validID(groupID) {
+		return fmt.Sprintf(groupPath, *groupID)
+	}
+	return fallback
+}
+
+func memberEndpoint(projectID, groupID *int, id string) string {
+	if validID(projectID) {
+		return fmt.Sprintf("/projects/%d/members/%s", *projectID, id)
+	}
+	if validID(groupID) {
+		return fmt.Sprintf("/groups/%d/members/%s", *groupID, id)
+	}
+	return ""
+}
+
+func jobsRequest(projectID, pipelineID *int, scope string) (string, url.Values) {
+	query := url.Values{}
+	endpoint := fmt.Sprintf("/projects/%d/jobs", *projectID)
+	if validID(pipelineID) {
+		return fmt.Sprintf("/projects/%d/pipelines/%d/jobs", *projectID, *pipelineID), query
+	}
+
+	setText(query, "scope", scope)
+	return endpoint, query
+}
+
+func (s *Server) defaultBranch(ctx context.Context, projectID int) string {
+	raw, err := s.client.Get(ctx, fmt.Sprintf("/projects/%d", projectID), url.Values{})
+	if err != nil {
+		return ""
+	}
+
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	db, ok := m["default_branch"].(string)
+	if !ok {
+		return ""
+	}
+
+	return db
+}
+
+func fileContent(f map[string]any) string {
+	b64, ok := f["content"].(string)
+	if !ok {
+		return ""
+	}
+
+	dec, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return ""
+	}
+
+	return string(dec)
+}
 
 func (s *Server) getFile(ctx context.Context, _ *mcp.CallToolRequest, input GetFileInput) (*mcp.CallToolResult, any, error) {
 	if input.ProjectID <= 0 {
 		return nil, nil, errors.New("project_id é obrigatório")
 	}
+
 	path := strings.TrimSpace(input.Path)
 	if path == "" {
 		return nil, nil, errors.New("path é obrigatório")
 	}
-	query := url.Values{}
+
 	ref := strings.TrimSpace(input.Ref)
 	if ref == "" {
-		if proj, perr := s.client.Get(ctx, fmt.Sprintf("/projects/%d", input.ProjectID), url.Values{}); perr == nil {
-			if pm, ok := proj.(map[string]any); ok {
-				if db, ok := pm["default_branch"].(string); ok && db != "" {
-					ref = db
-				}
-			}
-		}
+		ref = s.defaultBranch(ctx, input.ProjectID)
 	}
+
+	query := url.Values{}
 	query.Set("ref", ref)
-	raw, err := s.client.Get(ctx, fmt.Sprintf("/projects/%d/repository/files/%s", input.ProjectID, url.PathEscape(path)), query)
+
+	endpoint := fmt.Sprintf("/projects/%d/repository/files/%s", input.ProjectID, url.PathEscape(path))
+	raw, err := s.client.Get(ctx, endpoint, query)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	f, ok := raw.(map[string]any)
 	if !ok {
 		return nil, nil, errors.New("resposta inesperada do GitLab")
 	}
-	content := ""
-	if b64, ok := f["content"].(string); ok {
-		if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
-			content = string(dec)
+
+	content := fileContent(f)
+	size := len(content)
+	truncated := size > MAX_FILE_BYTES
+	if truncated {
+		content = content[:MAX_FILE_BYTES]
+	}
+
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "📄 %s", path)
+
+	fileRef, ok := f["ref"].(string)
+	if ok {
+		if fileRef != "" {
+			fmt.Fprintf(&b, " (@%s)", fileRef)
 		}
 	}
-	size := len(content)
-	if size > maxFileBytes {
-		content = content[:maxFileBytes]
+
+	if truncated {
+		b.WriteString(FILE_TRUNCATED_MSG)
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "📄 %s", path)
-	if ref, ok := f["ref"].(string); ok && ref != "" {
-		fmt.Fprintf(&b, " (@%s)", ref)
-	}
-	if size > maxFileBytes {
-		b.WriteString(" (truncado em 200KB)")
-	}
+
 	fmt.Fprintf(&b, "\n\n```%s\n", langFromPath(path))
 	b.WriteString(content)
 	if !strings.HasSuffix(content, "\n") {
 		b.WriteString("\n")
 	}
 	b.WriteString("```")
-	if size > maxFileBytes {
+
+	if truncated {
 		b.WriteString("\n\n⚠️ Arquivo maior que 200KB: conteúdo truncado. Use gitlab_get_file com um ref específico se precisar de outra parte (ou rode localmente).")
 	}
+
 	return textResult(strings.TrimSpace(b.String()))
 }
 
 func humanSize(n int) string {
 	switch {
-	case n >= 1024*1024:
-		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
-	case n >= 1024:
-		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	case n >= MEGABYTE:
+		return fmt.Sprintf("%.1f MB", float64(n)/MEGABYTE)
+	case n >= KILOBYTE:
+		return fmt.Sprintf("%.1f KB", float64(n)/KILOBYTE)
 	default:
 		return fmt.Sprintf("%d B", n)
 	}
 }
 
 func perPage(p *int) int {
-	if p != nil && *p > 0 {
-		if *p > 100 {
-			return 100
+	if validID(p) {
+		if *p > MAX_PER_PAGE {
+			return MAX_PER_PAGE
 		}
 		return *p
 	}
-	return 50
+	return DEFAULT_PER_PAGE
 }
 
 func textResult(text string) (*mcp.CallToolResult, any, error) {
@@ -149,18 +262,17 @@ func (s *Server) search(ctx context.Context, _ *mcp.CallToolRequest, input Searc
 	if strings.TrimSpace(input.Scope) == "" {
 		return nil, nil, errors.New("scope é obrigatório")
 	}
+
 	if strings.TrimSpace(input.Search) == "" {
 		return nil, nil, errors.New("search é obrigatório")
 	}
+
 	query := url.Values{}
 	query.Set("scope", strings.TrimSpace(input.Scope))
 	query.Set("search", strings.TrimSpace(input.Search))
-	if input.ProjectID != nil && *input.ProjectID > 0 {
-		query.Set("project_id", strconv.Itoa(*input.ProjectID))
-	}
-	if input.GroupID != nil && *input.GroupID > 0 {
-		query.Set("group_id", strconv.Itoa(*input.GroupID))
-	}
+	optionalID(query, "project_id", input.ProjectID)
+	optionalID(query, "group_id", input.GroupID)
+
 	items, err := s.client.List(ctx, "/search", query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -181,27 +293,30 @@ type ListProjectsInput struct {
 
 func (s *Server) listProjects(ctx context.Context, _ *mcp.CallToolRequest, input ListProjectsInput) (*mcp.CallToolResult, any, error) {
 	query := url.Values{}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
+	setText(query, "search", input.Search)
+
 	membership := true
 	if input.Membership != nil {
 		membership = *input.Membership
 	}
 	query.Set("membership", strconv.FormatBool(membership))
-	if input.Owned != nil && *input.Owned {
-		query.Set("owned", "true")
+
+	if input.Owned != nil {
+		if *input.Owned {
+			query.Set("owned", "true")
+		}
 	}
 	if input.Archived != nil {
 		query.Set("archived", strconv.FormatBool(*input.Archived))
 	}
-	if input.Starred != nil && *input.Starred {
-		query.Set("starred", "true")
+	if input.Starred != nil {
+		if *input.Starred {
+			query.Set("starred", "true")
+		}
 	}
-	if input.OrderBy != "" {
-		query.Set("order_by", input.OrderBy)
-		query.Set("sort", input.Sort)
-	}
+
+	setOrder(query, input.OrderBy, input.Sort)
+
 	items, err := s.client.List(ctx, "/projects", query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -218,15 +333,13 @@ type ListUsersInput struct {
 
 func (s *Server) listUsers(ctx context.Context, _ *mcp.CallToolRequest, input ListUsersInput) (*mcp.CallToolResult, any, error) {
 	query := url.Values{}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
-	if input.Username != "" {
-		query.Set("username", input.Username)
-	}
+	setText(query, "search", input.Search)
+	setText(query, "username", input.Username)
+
 	if input.Active != nil {
 		query.Set("active", strconv.FormatBool(*input.Active))
 	}
+
 	items, err := s.client.List(ctx, "/users", query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -251,41 +364,19 @@ type ListIssuesInput struct {
 }
 
 func (s *Server) listIssues(ctx context.Context, _ *mcp.CallToolRequest, input ListIssuesInput) (*mcp.CallToolResult, any, error) {
-	endpoint := "/issues"
-	if input.ProjectID != nil && *input.ProjectID > 0 {
-		endpoint = fmt.Sprintf("/projects/%d/issues", *input.ProjectID)
-	} else if input.GroupID != nil && *input.GroupID > 0 {
-		endpoint = fmt.Sprintf("/groups/%d/issues", *input.GroupID)
-	}
+	endpoint := scopedEndpoint("/issues", "/projects/%d/issues", "/groups/%d/issues", input.ProjectID, input.GroupID)
+
 	query := url.Values{}
-	if input.State != "" {
-		query.Set("state", input.State)
-	}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
-	if input.Labels != "" {
-		query.Set("labels", input.Labels)
-	}
-	if input.Milestone != "" {
-		query.Set("milestone", input.Milestone)
-	}
-	if input.AuthorID != nil {
-		query.Set("author_id", strconv.Itoa(*input.AuthorID))
-	}
-	if input.AssigneeID != nil {
-		query.Set("assignee_id", strconv.Itoa(*input.AssigneeID))
-	}
-	if input.CreatedAfter != "" {
-		query.Set("created_after", input.CreatedAfter)
-	}
-	if input.UpdatedAfter != "" {
-		query.Set("updated_after", input.UpdatedAfter)
-	}
-	if input.OrderBy != "" {
-		query.Set("order_by", input.OrderBy)
-		query.Set("sort", input.Sort)
-	}
+	setText(query, "state", input.State)
+	setText(query, "search", input.Search)
+	setText(query, "labels", input.Labels)
+	setText(query, "milestone", input.Milestone)
+	optionalID(query, "author_id", input.AuthorID)
+	optionalID(query, "assignee_id", input.AssigneeID)
+	setText(query, "created_after", input.CreatedAfter)
+	setText(query, "updated_after", input.UpdatedAfter)
+	setOrder(query, input.OrderBy, input.Sort)
+
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -310,41 +401,19 @@ type ListMergeRequestsInput struct {
 }
 
 func (s *Server) listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, input ListMergeRequestsInput) (*mcp.CallToolResult, any, error) {
-	endpoint := "/merge_requests"
-	if input.ProjectID != nil && *input.ProjectID > 0 {
-		endpoint = fmt.Sprintf("/projects/%d/merge_requests", *input.ProjectID)
-	} else if input.GroupID != nil && *input.GroupID > 0 {
-		endpoint = fmt.Sprintf("/groups/%d/merge_requests", *input.GroupID)
-	}
+	endpoint := scopedEndpoint("/merge_requests", "/projects/%d/merge_requests", "/groups/%d/merge_requests", input.ProjectID, input.GroupID)
+
 	query := url.Values{}
-	if input.State != "" {
-		query.Set("state", input.State)
-	}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
-	if input.Labels != "" {
-		query.Set("labels", input.Labels)
-	}
-	if input.Milestone != "" {
-		query.Set("milestone", input.Milestone)
-	}
-	if input.AuthorID != nil {
-		query.Set("author_id", strconv.Itoa(*input.AuthorID))
-	}
-	if input.AssigneeID != nil {
-		query.Set("assignee_id", strconv.Itoa(*input.AssigneeID))
-	}
-	if input.TargetBranch != "" {
-		query.Set("target_branch", input.TargetBranch)
-	}
-	if input.SourceBranch != "" {
-		query.Set("source_branch", input.SourceBranch)
-	}
-	if input.OrderBy != "" {
-		query.Set("order_by", input.OrderBy)
-		query.Set("sort", input.Sort)
-	}
+	setText(query, "state", input.State)
+	setText(query, "search", input.Search)
+	setText(query, "labels", input.Labels)
+	setText(query, "milestone", input.Milestone)
+	optionalID(query, "author_id", input.AuthorID)
+	optionalID(query, "assignee_id", input.AssigneeID)
+	setText(query, "target_branch", input.TargetBranch)
+	setText(query, "source_branch", input.SourceBranch)
+	setOrder(query, input.OrderBy, input.Sort)
+
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -365,29 +434,18 @@ type ListPipelinesInput struct {
 }
 
 func (s *Server) listPipelines(ctx context.Context, _ *mcp.CallToolRequest, input ListPipelinesInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
+
 	query := url.Values{}
-	if input.Status != "" {
-		query.Set("status", input.Status)
-	}
-	if input.Ref != "" {
-		query.Set("ref", input.Ref)
-	}
-	if input.SHA != "" {
-		query.Set("sha", input.SHA)
-	}
-	if input.UpdatedAfter != "" {
-		query.Set("updated_after", input.UpdatedAfter)
-	}
-	if input.Username != "" {
-		query.Set("username", input.Username)
-	}
-	if input.OrderBy != "" {
-		query.Set("order_by", input.OrderBy)
-		query.Set("sort", input.Sort)
-	}
+	setText(query, "status", input.Status)
+	setText(query, "ref", input.Ref)
+	setText(query, "sha", input.SHA)
+	setText(query, "updated_after", input.UpdatedAfter)
+	setText(query, "username", input.Username)
+	setOrder(query, input.OrderBy, input.Sort)
+
 	endpoint := fmt.Sprintf("/projects/%d/pipelines", *input.ProjectID)
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
@@ -403,13 +461,13 @@ type ListBranchesInput struct {
 }
 
 func (s *Server) listBranches(ctx context.Context, _ *mcp.CallToolRequest, input ListBranchesInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
+
 	query := url.Values{}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
+	setText(query, "search", input.Search)
+
 	endpoint := fmt.Sprintf("/projects/%d/repository/branches", *input.ProjectID)
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
@@ -428,22 +486,16 @@ type ListCommitsInput struct {
 }
 
 func (s *Server) listCommits(ctx context.Context, _ *mcp.CallToolRequest, input ListCommitsInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
+
 	query := url.Values{}
-	if input.RefName != "" {
-		query.Set("ref_name", input.RefName)
-	}
-	if input.Since != "" {
-		query.Set("since", input.Since)
-	}
-	if input.Until != "" {
-		query.Set("until", input.Until)
-	}
-	if input.Author != "" {
-		query.Set("author", input.Author)
-	}
+	setText(query, "ref_name", input.RefName)
+	setText(query, "since", input.Since)
+	setText(query, "until", input.Until)
+	setText(query, "author", input.Author)
+
 	endpoint := fmt.Sprintf("/projects/%d/repository/commits", *input.ProjectID)
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
@@ -460,19 +512,19 @@ type ListProjectMembersInput struct {
 }
 
 func (s *Server) listProjectMembers(ctx context.Context, _ *mcp.CallToolRequest, input ListProjectMembersInput) (*mcp.CallToolResult, any, error) {
-	var endpoint string
+	endpoint := ""
 	switch {
-	case input.ProjectID != nil && *input.ProjectID > 0:
+	case validID(input.ProjectID):
 		endpoint = fmt.Sprintf("/projects/%d/members/all", *input.ProjectID)
-	case input.GroupID != nil && *input.GroupID > 0:
+	case validID(input.GroupID):
 		endpoint = fmt.Sprintf("/groups/%d/members/all", *input.GroupID)
 	default:
 		return nil, nil, errors.New("informe project_id ou group_id")
 	}
+
 	query := url.Values{}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
+	setText(query, "search", input.Search)
+
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -489,17 +541,14 @@ type ListTagsInput struct {
 }
 
 func (s *Server) listTags(ctx context.Context, _ *mcp.CallToolRequest, input ListTagsInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
+
 	query := url.Values{}
-	if input.OrderBy != "" {
-		query.Set("order_by", input.OrderBy)
-		query.Set("sort", input.Sort)
-	}
-	if input.Search != "" {
-		query.Set("search", input.Search)
-	}
+	setOrder(query, input.OrderBy, input.Sort)
+	setText(query, "search", input.Search)
+
 	endpoint := fmt.Sprintf("/projects/%d/repository/tags", *input.ProjectID)
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
@@ -516,16 +565,11 @@ type ListJobsInput struct {
 }
 
 func (s *Server) listJobs(ctx context.Context, _ *mcp.CallToolRequest, input ListJobsInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
-	query := url.Values{}
-	endpoint := fmt.Sprintf("/projects/%d/jobs", *input.ProjectID)
-	if input.PipelineID != nil && *input.PipelineID > 0 {
-		endpoint = fmt.Sprintf("/projects/%d/pipelines/%d/jobs", *input.ProjectID, *input.PipelineID)
-	} else if input.Scope != "" {
-		query.Set("scope", input.Scope)
-	}
+
+	endpoint, query := jobsRequest(input.ProjectID, input.PipelineID, input.Scope)
 	items, err := s.client.List(ctx, endpoint, query, perPage(input.PerPage))
 	if err != nil {
 		return nil, nil, err
@@ -576,7 +620,9 @@ func (s *Server) list(ctx context.Context, _ *mcp.CallToolRequest, input ListInp
 			Sort: input.Sort, PerPage: input.PerPage,
 		})
 	case "user", "users":
-		return s.listUsers(ctx, nil, ListUsersInput{Search: input.Search, Username: input.Username, Active: input.Active, PerPage: input.PerPage})
+		return s.listUsers(ctx, nil, ListUsersInput{
+			Search: input.Search, Username: input.Username, Active: input.Active, PerPage: input.PerPage,
+		})
 	case "issue", "issues":
 		return s.listIssues(ctx, nil, ListIssuesInput{
 			ProjectID: input.ProjectID, GroupID: input.GroupID, State: input.State,
@@ -598,18 +644,26 @@ func (s *Server) list(ctx context.Context, _ *mcp.CallToolRequest, input ListInp
 			Sort: input.Sort, PerPage: input.PerPage,
 		})
 	case "branch", "branches":
-		return s.listBranches(ctx, nil, ListBranchesInput{ProjectID: input.ProjectID, Search: input.Search, PerPage: input.PerPage})
+		return s.listBranches(ctx, nil, ListBranchesInput{
+			ProjectID: input.ProjectID, Search: input.Search, PerPage: input.PerPage,
+		})
 	case "commit", "commits":
 		return s.listCommits(ctx, nil, ListCommitsInput{
 			ProjectID: input.ProjectID, RefName: input.RefName, Since: input.Since,
 			Until: input.Until, Author: input.Author, PerPage: input.PerPage,
 		})
 	case "member", "members":
-		return s.listProjectMembers(ctx, nil, ListProjectMembersInput{ProjectID: input.ProjectID, GroupID: input.GroupID, Search: input.Search, PerPage: input.PerPage})
+		return s.listProjectMembers(ctx, nil, ListProjectMembersInput{
+			ProjectID: input.ProjectID, GroupID: input.GroupID, Search: input.Search, PerPage: input.PerPage,
+		})
 	case "tag", "tags":
-		return s.listTags(ctx, nil, ListTagsInput{ProjectID: input.ProjectID, OrderBy: input.OrderBy, Sort: input.Sort, Search: input.Search, PerPage: input.PerPage})
+		return s.listTags(ctx, nil, ListTagsInput{
+			ProjectID: input.ProjectID, OrderBy: input.OrderBy, Sort: input.Sort, Search: input.Search, PerPage: input.PerPage,
+		})
 	case "job", "jobs":
-		return s.listJobs(ctx, nil, ListJobsInput{ProjectID: input.ProjectID, PipelineID: input.PipelineID, Scope: input.Scope, PerPage: input.PerPage})
+		return s.listJobs(ctx, nil, ListJobsInput{
+			ProjectID: input.ProjectID, PipelineID: input.PipelineID, Scope: input.Scope, PerPage: input.PerPage,
+		})
 	default:
 		return nil, nil, fmt.Errorf("entidade inválida: %q (use 'projects', 'users', 'issues', 'merge_requests', 'pipelines', 'branches', 'commits', 'members', 'tags' ou 'jobs')", input.Entity)
 	}
@@ -622,49 +676,65 @@ type GetItemInput struct {
 	GroupID   *int   `json:"group_id,omitempty" jsonschema:"Group ID (members; alternative to project_id)"`
 }
 
+func needProjectID(entity string) bool {
+	switch entity {
+	case "issue", "issues", "merge_request", "merge_requests", "mr", "pipeline", "pipelines",
+		"branch", "branches", "commit", "commits", "tag", "tags", "job", "jobs":
+		return true
+	default:
+		return false
+	}
+}
+
+func itemEndpoint(entity, id string, projectID, groupID *int) (string, error) {
+	switch entity {
+	case "project", "projects":
+		return fmt.Sprintf("/projects/%s", id), nil
+	case "user", "users":
+		return fmt.Sprintf("/users/%s", id), nil
+	case "issue", "issues":
+		return fmt.Sprintf("/projects/%d/issues/%s", *projectID, id), nil
+	case "merge_request", "merge_requests", "mr":
+		return fmt.Sprintf("/projects/%d/merge_requests/%s", *projectID, id), nil
+	case "pipeline", "pipelines":
+		return fmt.Sprintf("/projects/%d/pipelines/%s", *projectID, id), nil
+	case "branch", "branches":
+		return fmt.Sprintf("/projects/%d/repository/branches/%s", *projectID, url.PathEscape(id)), nil
+	case "commit", "commits":
+		return fmt.Sprintf("/projects/%d/repository/commits/%s", *projectID, id), nil
+	case "member", "members":
+		endpoint := memberEndpoint(projectID, groupID, id)
+		if endpoint == "" {
+			return "", errors.New("informe project_id ou group_id")
+		}
+		return endpoint, nil
+	case "tag", "tags":
+		return fmt.Sprintf("/projects/%d/repository/tags/%s", *projectID, url.PathEscape(id)), nil
+	case "job", "jobs":
+		return fmt.Sprintf("/projects/%d/jobs/%s", *projectID, id), nil
+	default:
+		return "", fmt.Errorf("entity inválida: %q (use 'projects','users','issues','merge_requests','pipelines','branches','commits','members','tags' ou 'jobs')", entity)
+	}
+}
+
 func (s *Server) getItem(ctx context.Context, _ *mcp.CallToolRequest, input GetItemInput) (*mcp.CallToolResult, any, error) {
 	entity := strings.ToLower(strings.TrimSpace(input.Entity))
 	id := strings.TrimSpace(input.ID)
 	if id == "" {
 		return nil, nil, errors.New("id é obrigatório")
 	}
-	needProject := entity == "issue" || entity == "issues" || entity == "merge_request" || entity == "merge_requests" ||
-		entity == "mr" || entity == "pipeline" || entity == "pipelines" || entity == "branch" || entity == "branches" ||
-		entity == "commit" || entity == "commits" || entity == "tag" || entity == "tags" || entity == "job" || entity == "jobs"
-	if needProject && (input.ProjectID == nil || *input.ProjectID <= 0) {
-		return nil, nil, errors.New("project_id é obrigatório")
-	}
-	var endpoint string
-	switch entity {
-	case "project", "projects":
-		endpoint = "/projects/" + id
-	case "user", "users":
-		endpoint = "/users/" + id
-	case "issue", "issues":
-		endpoint = fmt.Sprintf("/projects/%d/issues/%s", *input.ProjectID, id)
-	case "merge_request", "merge_requests", "mr":
-		endpoint = fmt.Sprintf("/projects/%d/merge_requests/%s", *input.ProjectID, id)
-	case "pipeline", "pipelines":
-		endpoint = fmt.Sprintf("/projects/%d/pipelines/%s", *input.ProjectID, id)
-	case "branch", "branches":
-		endpoint = fmt.Sprintf("/projects/%d/repository/branches/%s", *input.ProjectID, url.PathEscape(id))
-	case "commit", "commits":
-		endpoint = fmt.Sprintf("/projects/%d/repository/commits/%s", *input.ProjectID, id)
-	case "member", "members":
-		if input.ProjectID != nil && *input.ProjectID > 0 {
-			endpoint = fmt.Sprintf("/projects/%d/members/%s", *input.ProjectID, id)
-		} else if input.GroupID != nil && *input.GroupID > 0 {
-			endpoint = fmt.Sprintf("/groups/%d/members/%s", *input.GroupID, id)
-		} else {
-			return nil, nil, errors.New("informe project_id ou group_id")
+
+	if needProjectID(entity) {
+		if err := requireProjectID(input.ProjectID); err != nil {
+			return nil, nil, err
 		}
-	case "tag", "tags":
-		endpoint = fmt.Sprintf("/projects/%d/repository/tags/%s", *input.ProjectID, url.PathEscape(id))
-	case "job", "jobs":
-		endpoint = fmt.Sprintf("/projects/%d/jobs/%s", *input.ProjectID, id)
-	default:
-		return nil, nil, fmt.Errorf("entity inválida: %q (use 'projects','users','issues','merge_requests','pipelines','branches','commits','members','tags' ou 'jobs')", input.Entity)
 	}
+
+	endpoint, err := itemEndpoint(entity, id, input.ProjectID, input.GroupID)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	raw, err := s.client.Get(ctx, endpoint, url.Values{})
 	if err != nil {
 		return nil, nil, err
@@ -680,21 +750,22 @@ type GetTreeInput struct {
 }
 
 func (s *Server) getTree(ctx context.Context, _ *mcp.CallToolRequest, input GetTreeInput) (*mcp.CallToolResult, any, error) {
-	if input.ProjectID == nil || *input.ProjectID <= 0 {
-		return nil, nil, errors.New("project_id é obrigatório")
+	if err := requireProjectID(input.ProjectID); err != nil {
+		return nil, nil, err
 	}
+
 	query := url.Values{}
-	if input.Path != "" {
-		query.Set("path", input.Path)
+	setText(query, "path", input.Path)
+	setText(query, "ref", input.Ref)
+
+	if input.Recursive != nil {
+		if *input.Recursive {
+			query.Set("recursive", "true")
+		}
 	}
-	if input.Ref != "" {
-		query.Set("ref", input.Ref)
-	}
-	if input.Recursive != nil && *input.Recursive {
-		query.Set("recursive", "true")
-	}
+
 	endpoint := fmt.Sprintf("/projects/%d/repository/tree", *input.ProjectID)
-	items, err := s.client.List(ctx, endpoint, query, 1000)
+	items, err := s.client.List(ctx, endpoint, query, MAX_TREE_ITEMS)
 	if err != nil {
 		return nil, nil, err
 	}

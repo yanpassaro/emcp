@@ -12,17 +12,23 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
 )
 
 const (
-	defaultBaseURL        = "https://api.taiga.io"
-	defaultMaxDownload    = 100 * 1024 * 1024
-	maxJSONResponseBytes  = 32 * 1024 * 1024
-	maxErrorResponseBytes = 8 * 1024
+	DEFAULT_BASE_URL          = "https://api.taiga.io"
+	DEFAULT_MAX_DOWNLOAD      = 100 * 1024 * 1024
+	MAX_JSON_RESPONSE_BYTES   = 32 * 1024 * 1024
+	MAX_ERROR_RESPONSE_BYTES  = 8 * 1024
+	DEFAULT_AUTH_SCHEME       = "Bearer"
+	DEFAULT_TIMEOUT           = 60 * time.Second
+	MAX_DOWNLOAD_ATTEMPTS     = 10000
+	DEFAULT_ATTACHMENT_NAME   = "attachment"
+	DISABLE_PAGINATION_HEADER = "x-disable-pagination"
+	HTTP_STATUS_RANGE_MIN     = 200
+	HTTP_STATUS_RANGE_MAX     = 300
 )
 
 type Config struct {
@@ -62,33 +68,51 @@ type DownloadResult struct {
 func NewClient(cfg Config) (*Client, error) {
 	base := strings.TrimSpace(cfg.BaseURL)
 	if base == "" {
-		base = defaultBaseURL
+		base = DEFAULT_BASE_URL
 	}
+
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("invalid TAIGA_URL: %w", err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+
+	invalid := false
+	if u.Scheme != "http" {
+		if u.Scheme != "https" {
+			invalid = true
+		}
+	}
+
+	if invalid {
 		return nil, errors.New("TAIGA_URL must use http or https")
 	}
+
 	if u.Host == "" {
 		return nil, errors.New("TAIGA_URL must include a host")
 	}
-	if u.RawQuery != "" || u.Fragment != "" {
+
+	if u.RawQuery != "" {
 		return nil, errors.New("TAIGA_URL must not contain a query string or fragment")
 	}
+
+	if u.Fragment != "" {
+		return nil, errors.New("TAIGA_URL must not contain a query string or fragment")
+	}
+
 	basePath := strings.TrimRight(u.Path, "/")
 	if !strings.HasSuffix(basePath, "/api/v1") {
 		basePath += "/api/v1"
 	}
+
 	u.Path = basePath
 	u.RawPath = ""
 
 	token := strings.TrimSpace(cfg.Token)
 	authScheme := strings.TrimSpace(cfg.AuthScheme)
 	if authScheme == "" {
-		authScheme = "Bearer"
+		authScheme = DEFAULT_AUTH_SCHEME
 	}
+
 	if strings.ContainsAny(authScheme, " \t\r\n") {
 		return nil, errors.New("TAIGA_AUTH_SCHEME must not contain whitespace")
 	}
@@ -97,18 +121,20 @@ func NewClient(cfg Config) (*Client, error) {
 	if downloadDir == "" {
 		downloadDir = filepath.Join(UserLocalDir(), "mcp", "taiga", "downloads")
 	}
-	downloadDir, err = filepath.Abs(downloadDir)
+
+	absDir, err := filepath.Abs(downloadDir)
 	if err != nil {
 		return nil, fmt.Errorf("invalid download directory: %w", err)
 	}
+
 	maxDownloadBytes := cfg.MaxDownloadBytes
 	if maxDownloadBytes <= 0 {
-		maxDownloadBytes = defaultMaxDownload
+		maxDownloadBytes = DEFAULT_MAX_DOWNLOAD
 	}
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		httpClient = &http.Client{Timeout: DEFAULT_TIMEOUT}
 	}
 
 	return &Client{
@@ -116,102 +142,105 @@ func NewClient(cfg Config) (*Client, error) {
 		token:            token,
 		authScheme:       authScheme,
 		httpClient:       httpClient,
-		downloadDir:      downloadDir,
+		downloadDir:      absDir,
 		maxDownloadBytes: maxDownloadBytes,
 	}, nil
 }
 
 func UserLocalDir() string {
-	if home := os.Getenv("USERPROFILE"); home != "" {
+	home := os.Getenv("USERPROFILE")
+	if home != "" {
 		return filepath.Join(home, ".local", "share")
 	}
-	if home := os.Getenv("HOME"); home != "" {
+
+	home = os.Getenv("HOME")
+	if home != "" {
 		return filepath.Join(home, ".local", "share")
 	}
+
 	return filepath.Join(".", "taiga-mcp")
 }
 
+func isSuccess(status int) bool {
+	if status < HTTP_STATUS_RANGE_MIN {
+		return false
+	}
+	return status < HTTP_STATUS_RANGE_MAX
+}
+
+func errorMessage(resp *http.Response) string {
+	detail, err := io.ReadAll(io.LimitReader(resp.Body, MAX_ERROR_RESPONSE_BYTES))
+	if err != nil {
+		return http.StatusText(resp.StatusCode)
+	}
+
+	message := strings.TrimSpace(string(detail))
+	if message == "" {
+		return http.StatusText(resp.StatusCode)
+	}
+
+	return message
+}
+
+func (c *Client) postAuth(ctx context.Context, endpoint string, payload map[string]string) (string, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal auth payload: %w", err)
+	}
+
+	u := c.endpointURL(endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create auth request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("auth request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if !isSuccess(resp.StatusCode) {
+		return "", fmt.Errorf("auth failed (HTTP %d): %s", resp.StatusCode, errorMessage(resp))
+	}
+
+	result := struct {
+		AuthToken string `json:"auth_token"`
+	}{}
+
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MAX_JSON_RESPONSE_BYTES)).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode auth response: %w", err)
+	}
+
+	if result.AuthToken == "" {
+		return "", errors.New("auth returned empty auth_token")
+	}
+
+	c.token = result.AuthToken
+	c.authScheme = DEFAULT_AUTH_SCHEME
+	return c.token, nil
+}
+
 func (c *Client) Login(ctx context.Context, username, password string) error {
-	body, err := json.Marshal(map[string]string{
+	_, err := c.postAuth(ctx, "/auth", map[string]string{
 		"type":     "normal",
 		"username": username,
 		"password": password,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal login payload: %w", err)
+		return fmt.Errorf("login: %w", err)
 	}
-	u := c.endpointURL("/auth", nil)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(string(body)))
-	if err != nil {
-		return fmt.Errorf("create login request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("login request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
-		message := strings.TrimSpace(string(detail))
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
-		}
-		return fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode, message)
-	}
-	var result struct {
-		AuthToken string `json:"auth_token"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseBytes)).Decode(&result); err != nil {
-		return fmt.Errorf("decode login response: %w", err)
-	}
-	if result.AuthToken == "" {
-		return errors.New("login returned empty auth_token")
-	}
-	c.token = result.AuthToken
-	c.authScheme = "Bearer"
 	return nil
 }
 
 func (c *Client) RefreshToken(ctx context.Context, refreshToken string) error {
-	body, err := json.Marshal(map[string]string{"refresh": refreshToken})
+	_, err := c.postAuth(ctx, "/auth/refresh", map[string]string{"refresh": refreshToken})
 	if err != nil {
-		return fmt.Errorf("marshal refresh payload: %w", err)
+		return fmt.Errorf("refresh: %w", err)
 	}
-	u := c.endpointURL("/auth/refresh", nil)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(string(body)))
-	if err != nil {
-		return fmt.Errorf("create refresh request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("refresh request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
-		message := strings.TrimSpace(string(detail))
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
-		}
-		return fmt.Errorf("refresh failed (HTTP %d): %s", resp.StatusCode, message)
-	}
-	var result struct {
-		AuthToken string `json:"auth_token"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseBytes)).Decode(&result); err != nil {
-		return fmt.Errorf("decode refresh response: %w", err)
-	}
-	if result.AuthToken == "" {
-		return errors.New("refresh returned empty auth_token")
-	}
-	c.token = result.AuthToken
-	c.authScheme = "Bearer"
 	return nil
 }
 
@@ -224,14 +253,16 @@ func (c *Client) PatchJSON(ctx context.Context, endpoint string, query url.Value
 	if err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("marshal PATCH body: %w", err)
 	}
+
 	u := c.endpointURL(endpoint, query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("create Taiga PATCH request: %w", err)
 	}
+
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", c.authScheme+" "+c.token)
+	req.Header.Set("Authorization", c.authorization())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -239,17 +270,12 @@ func (c *Client) PatchJSON(ctx context.Context, endpoint string, query url.Value
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
-		message := strings.TrimSpace(string(detail))
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
-		}
-		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, message)
+	if !isSuccess(resp.StatusCode) {
+		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
 	}
 
-	var result any
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseBytes))
+	result := any(nil)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, MAX_JSON_RESPONSE_BYTES))
 	if err := decoder.Decode(&result); err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("decode Taiga response: %w", err)
 	}
@@ -259,7 +285,7 @@ func (c *Client) PatchJSON(ctx context.Context, endpoint string, query url.Value
 func (c *Client) ListJSON(ctx context.Context, endpoint string, query url.Values, paginated bool) (any, ResponseMeta, error) {
 	headers := map[string]string{}
 	if !paginated {
-		headers["x-disable-pagination"] = "True"
+		headers[DISABLE_PAGINATION_HEADER] = "True"
 	}
 	return c.doJSONWithHeaders(ctx, endpoint, query, headers)
 }
@@ -268,14 +294,19 @@ func (c *Client) doJSON(ctx context.Context, endpoint string, query url.Values) 
 	return c.doJSONWithHeaders(ctx, endpoint, query, nil)
 }
 
+func (c *Client) authorization() string {
+	return fmt.Sprintf("%s %s", c.authScheme, c.token)
+}
+
 func (c *Client) doJSONWithHeaders(ctx context.Context, endpoint string, query url.Values, extraHeaders map[string]string) (any, ResponseMeta, error) {
 	u := c.endpointURL(endpoint, query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("create Taiga request: %w", err)
 	}
+
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", c.authScheme+" "+c.token)
+	req.Header.Set("Authorization", c.authorization())
 	for key, value := range extraHeaders {
 		req.Header.Set(key, value)
 	}
@@ -286,17 +317,12 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, endpoint string, query u
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
-		message := strings.TrimSpace(string(detail))
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
-		}
-		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, message)
+	if !isSuccess(resp.StatusCode) {
+		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
 	}
 
-	var result any
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseBytes))
+	result := any(nil)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, MAX_JSON_RESPONSE_BYTES))
 	if err := decoder.Decode(&result); err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("decode Taiga response: %w", err)
 	}
@@ -305,7 +331,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, endpoint string, query u
 
 func (c *Client) endpointURL(endpoint string, query url.Values) *url.URL {
 	u := *c.baseURL
-	u.Path = strings.TrimRight(c.baseURL.Path, "/") + "/" + strings.TrimLeft(endpoint, "/")
+	u.Path = fmt.Sprintf("%s/%s", strings.TrimRight(c.baseURL.Path, "/"), strings.TrimLeft(endpoint, "/"))
 	u.RawPath = ""
 	u.RawQuery = query.Encode()
 	return &u
@@ -322,39 +348,70 @@ func responseMeta(resp *http.Response) ResponseMeta {
 	}
 }
 
-func (c *Client) Download(ctx context.Context, rawURL string, filename string, destPath string) (DownloadResult, error) {
+func (c *Client) resolveSource(rawURL string) (*url.URL, error) {
 	source, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("invalid attachment URL: %w", err)
+		return nil, fmt.Errorf("invalid attachment URL: %w", err)
 	}
+
 	if !source.IsAbs() {
 		source = c.baseURL.ResolveReference(source)
 	}
-	if source.Scheme != "http" && source.Scheme != "https" {
-		return DownloadResult{}, errors.New("attachment URL must use http or https")
+
+	invalid := false
+	if source.Scheme != "http" {
+		if source.Scheme != "https" {
+			invalid = true
+		}
 	}
 
+	if invalid {
+		return nil, errors.New("attachment URL must use http or https")
+	}
+
+	return source, nil
+}
+
+func attachmentName(source *url.URL, filename string) string {
 	name := filename
-	if strings.TrimSpace(name) == "" {
-		name = source.Path
-		if decoded, decodeErr := url.PathUnescape(name); decodeErr == nil {
-			name = decoded
-		}
+	if strings.TrimSpace(name) != "" {
+		return sanitizeFilename(name)
 	}
-	name = sanitizeFilename(name)
 
-	targetDir := c.downloadDir
-	if strings.TrimSpace(destPath) != "" {
-		if filepath.Ext(strings.TrimSpace(destPath)) != "" {
-			targetDir = filepath.Dir(strings.TrimSpace(destPath))
-			name = filepath.Base(strings.TrimSpace(destPath))
-		} else {
-			targetDir = strings.TrimSpace(destPath)
-		}
+	name = source.Path
+	if decoded, err := url.PathUnescape(name); err == nil {
+		name = decoded
 	}
+
+	return sanitizeFilename(name)
+}
+
+func downloadTarget(dir, destPath string, name string) (string, string) {
+	targetDir := dir
+	if strings.TrimSpace(destPath) == "" {
+		return targetDir, name
+	}
+
+	if filepath.Ext(strings.TrimSpace(destPath)) != "" {
+		return filepath.Dir(strings.TrimSpace(destPath)), filepath.Base(strings.TrimSpace(destPath))
+	}
+
+	return strings.TrimSpace(destPath), name
+}
+
+func (c *Client) Download(ctx context.Context, rawURL string, filename string, destPath string) (DownloadResult, error) {
+	source, err := c.resolveSource(rawURL)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+
+	name := attachmentName(source, filename)
+	targetDir, name := downloadTarget(c.downloadDir, destPath, name)
+
 	if err := os.MkdirAll(targetDir, 0o750); err != nil {
 		return DownloadResult{}, fmt.Errorf("create download directory: %w", err)
 	}
+
 	destination, err := nextAvailablePath(targetDir, name)
 	if err != nil {
 		return DownloadResult{}, err
@@ -364,22 +421,21 @@ func (c *Client) Download(ctx context.Context, rawURL string, filename string, d
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("create attachment request: %w", err)
 	}
+
 	if sameOrigin(source, c.baseURL) {
-		req.Header.Set("Authorization", c.authScheme+" "+c.token)
+		req.Header.Set("Authorization", c.authorization())
 	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("download attachment: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
-		message := strings.TrimSpace(string(detail))
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
-		}
-		return DownloadResult{}, fmt.Errorf("attachment download returned HTTP %d: %s", resp.StatusCode, message)
+
+	if !isSuccess(resp.StatusCode) {
+		return DownloadResult{}, fmt.Errorf("attachment download returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
 	}
+
 	if resp.ContentLength > c.maxDownloadBytes {
 		return DownloadResult{}, fmt.Errorf("attachment exceeds the %d-byte download limit", c.maxDownloadBytes)
 	}
@@ -388,21 +444,29 @@ func (c *Client) Download(ctx context.Context, rawURL string, filename string, d
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("create temporary download: %w", err)
 	}
+
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
 	bytesWritten, err := io.Copy(tmp, io.LimitReader(resp.Body, c.maxDownloadBytes+1))
 	if err != nil {
-		_ = tmp.Close()
+		if cerr := tmp.Close(); cerr != nil {
+			return DownloadResult{}, errors.Join(fmt.Errorf("write attachment: %w", err), cerr)
+		}
 		return DownloadResult{}, fmt.Errorf("write attachment: %w", err)
 	}
+
 	if bytesWritten > c.maxDownloadBytes {
-		_ = tmp.Close()
+		if cerr := tmp.Close(); cerr != nil {
+			return DownloadResult{}, errors.Join(fmt.Errorf("attachment exceeds the %d-byte download limit", c.maxDownloadBytes), cerr)
+		}
 		return DownloadResult{}, fmt.Errorf("attachment exceeds the %d-byte download limit", c.maxDownloadBytes)
 	}
+
 	if err := tmp.Close(); err != nil {
 		return DownloadResult{}, fmt.Errorf("close temporary download: %w", err)
 	}
+
 	if err := os.Rename(tmpName, destination); err != nil {
 		return DownloadResult{}, fmt.Errorf("store downloaded attachment: %w", err)
 	}
@@ -416,47 +480,67 @@ func (c *Client) Download(ctx context.Context, rawURL string, filename string, d
 }
 
 func sameOrigin(a, b *url.URL) bool {
-	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+	sameScheme := strings.EqualFold(a.Scheme, b.Scheme)
+	if !sameScheme {
+		return false
+	}
+	return strings.EqualFold(a.Host, b.Host)
 }
 
 func nextAvailablePath(dir, filename string) (string, error) {
 	candidate := filepath.Join(dir, filename)
-	if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+	_, err := os.Stat(candidate)
+	if errors.Is(err, os.ErrNotExist) {
 		return candidate, nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return "", fmt.Errorf("check download destination: %w", err)
 	}
 
 	ext := filepath.Ext(filename)
 	stem := strings.TrimSuffix(filename, ext)
-	for i := 1; i < 10000; i++ {
-		candidate = filepath.Join(dir, stem+"-"+strconv.Itoa(i)+ext)
-		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+	for i := 1; i < MAX_DOWNLOAD_ATTEMPTS; i++ {
+		candidate = filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
+		_, err := os.Stat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
 			return candidate, nil
-		} else if err != nil {
+		}
+		if err != nil {
 			return "", fmt.Errorf("check download destination: %w", err)
 		}
 	}
+
 	return "", errors.New("could not find an unused download destination")
 }
 
 func sanitizeFilename(value string) string {
 	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
 	value = path.Base(value)
-	var builder strings.Builder
+
+	builder := strings.Builder{}
 	for _, r := range value {
 		switch {
-		case r == 0 || unicode.IsControl(r):
+		case r == 0:
 			builder.WriteRune('_')
-		case strings.ContainsRune(`<>:"/\\|?*`, r):
+		case unicode.IsControl(r):
+			builder.WriteRune('_')
+		case strings.ContainsRune(`<>:"/\|?*`, r):
 			builder.WriteRune('_')
 		default:
 			builder.WriteRune(r)
 		}
 	}
+
 	value = strings.Trim(builder.String(), ". ")
-	if value == "" || value == "." || value == ".." {
-		return "attachment"
+	if value == "" {
+		return DEFAULT_ATTACHMENT_NAME
 	}
+	if value == "." {
+		return DEFAULT_ATTACHMENT_NAME
+	}
+	if value == ".." {
+		return DEFAULT_ATTACHMENT_NAME
+	}
+
 	return value
 }

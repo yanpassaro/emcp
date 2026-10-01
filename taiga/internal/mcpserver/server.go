@@ -16,15 +16,43 @@ import (
 	"ntdsk.com/taiga/internal/taiga"
 )
 
+const (
+	DEFAULT_LIST_LIMIT      = 50
+	DISPLAY_CAP             = 50
+	DEFAULT_ACTIVITY_LIMIT  = 20
+	MAX_ACTIVITY_LIMIT      = 100
+	DEFAULT_SEARCH_LIMIT    = 10
+	MAX_SEARCH_LIMIT        = 30
+	DEFAULT_PROJECT_ACTIVES = 5
+	MAX_PROJECT_ACTIVES     = 20
+	MAX_PAGE_SIZE           = 1000
+	CARD                    = "card"
+	ISSUE                   = "issue"
+	TASK                    = "task"
+	USERSTORY               = "userstory"
+)
+
 type Server struct {
 	client *taiga.Client
 }
 
 var redactEnabled = true
 
+func redactDisabled(v string) bool {
+	if v == "false" {
+		return true
+	}
+	if v == "0" {
+		return true
+	}
+	if v == "no" {
+		return true
+	}
+	return v == "off"
+}
+
 func New(client *taiga.Client) *Server {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("TAIGA_REDACT")))
-	if v == "false" || v == "0" || v == "no" || v == "off" {
+	if redactDisabled(strings.ToLower(strings.TrimSpace(os.Getenv("TAIGA_REDACT")))) {
 		redactEnabled = false
 	}
 	return &Server{client: client}
@@ -74,38 +102,70 @@ type activityItem struct {
 	action   string
 }
 
+func hasItemFilter(input ListActivityInput) bool {
+	if input.CardID != nil {
+		return true
+	}
+	if input.IssueID != nil {
+		return true
+	}
+	return input.TaskID != nil
+}
+
+func activityLimit(input ListActivityInput) int {
+	if input.Limit == nil {
+		return DEFAULT_ACTIVITY_LIMIT
+	}
+
+	if *input.Limit <= 0 {
+		return DEFAULT_ACTIVITY_LIMIT
+	}
+
+	if *input.Limit > MAX_ACTIVITY_LIMIT {
+		return MAX_ACTIVITY_LIMIT
+	}
+
+	return *input.Limit
+}
+
+func activityProjectID(input ListActivityInput) int {
+	if input.ProjectID == nil {
+		return 0
+	}
+	return *input.ProjectID
+}
+
 func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mcp.CallToolResult, any, error) {
-	if input.CardID != nil || input.IssueID != nil || input.TaskID != nil {
+	if hasItemFilter(input) {
 		return s.listItemActivity(ctx, input)
 	}
-	limit := 20
-	if input.Limit != nil && *input.Limit > 0 {
-		limit = *input.Limit
-		if limit > 100 {
-			limit = 100
+
+	limit := activityLimit(input)
+	projectID := activityProjectID(input)
+
+	myID := 0
+	if input.My != nil {
+		if *input.My {
+			myID = s.loadCurrentUser(ctx)
 		}
 	}
-	var projectID int
-	if input.ProjectID != nil {
-		projectID = *input.ProjectID
-	}
-	var myID int
-	if input.My != nil && *input.My {
-		myID = s.loadCurrentUser(ctx)
-	}
+
 	query := url.Values{
 		"page":      []string{"1"},
 		"page_size": []string{strconv.Itoa(limit)},
 	}
+
 	if projectID > 0 {
 		query.Set("project", strconv.Itoa(projectID))
 	}
 	if myID > 0 {
 		query.Set("user", strconv.Itoa(myID))
 	}
+
 	raw, _, err := s.client.ListJSON(ctx, "/timeline", query, true)
 	if err == nil {
-		if items := activityItemsFromTimeline(raw); len(items) > 0 {
+		items := activityItemsFromTimeline(raw)
+		if len(items) > 0 {
 			sort.Slice(items, func(i, j int) bool { return items[i].modified > items[j].modified })
 			if len(items) > limit {
 				items = items[:limit]
@@ -114,93 +174,132 @@ func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mc
 		}
 	}
 
-	var items []activityItem
-	items = append(items, s.fetchRecentItems(ctx, "/userstories", "card", projectID, myID, limit)...)
-	items = append(items, s.fetchRecentItems(ctx, "/issues", "issue", projectID, myID, limit)...)
+	items := []activityItem{}
+	items = append(items, s.fetchRecentItems(ctx, "/userstories", CARD, projectID, myID, limit)...)
+	items = append(items, s.fetchRecentItems(ctx, "/issues", ISSUE, projectID, myID, limit)...)
 	sort.Slice(items, func(i, j int) bool { return items[i].modified > items[j].modified })
 	if len(items) > limit {
 		items = items[:limit]
 	}
+
 	s.enrichActivityActions(ctx, items)
 	return textResult(formatActivityTable(items))
 }
 
-func (s *Server) listItemActivity(ctx context.Context, input ListActivityInput) (*mcp.CallToolResult, any, error) {
-	var kind string
-	var id int
+func historyKind(kind string) string {
+	if kind == CARD {
+		return USERSTORY
+	}
+	return kind
+}
+
+func activityTarget(input ListActivityInput) (string, int) {
 	switch {
 	case input.CardID != nil:
-		kind, id = "card", *input.CardID
+		return CARD, *input.CardID
 	case input.IssueID != nil:
-		kind, id = "issue", *input.IssueID
+		return ISSUE, *input.IssueID
 	default:
-		kind, id = "task", *input.TaskID
+		return TASK, *input.TaskID
 	}
-	if id <= 0 {
-		return nil, nil, fmt.Errorf("o id do %s deve ser maior que zero", kind)
+}
+
+func activityEndpoint(kind string, id int) string {
+	return fmt.Sprintf("/%s/%d", historyKind(kind), id)
+}
+
+func itemSummary(itemData any) (string, int, string) {
+	m, ok := itemData.(map[string]any)
+	if !ok {
+		return "", 0, ""
 	}
 
-	historyKind := kind
-	if historyKind == "card" {
-		historyKind = "userstory"
+	return displayValue(m["subject"]), displayInt(m["ref"]), translateStatus(resolveName(m, "status"))
+}
+
+func historyAction(m map[string]any) string {
+	comment := strings.TrimSpace(displayValue(m["comment"]))
+	if comment != "" {
+		return fmt.Sprintf("💬 %s", comment)
 	}
 
-	var itemEndpoint string
-	switch historyKind {
-	case "userstory":
-		itemEndpoint = "/userstories/" + strconv.Itoa(id)
-	case "issue":
-		itemEndpoint = "/issues/" + strconv.Itoa(id)
-	default:
-		itemEndpoint = "/tasks/" + strconv.Itoa(id)
-	}
-	itemData, _, err := s.client.GetJSON(ctx, itemEndpoint, url.Values{})
-	if err != nil {
-		return nil, nil, err
-	}
-	subject, ref, status := "", 0, ""
-	if m, ok := itemData.(map[string]any); ok {
-		subject = displayValue(m["subject"])
-		ref = displayInt(m["ref"])
-		status = translateStatus(resolveName(m, "status"))
+	diff, ok := m["diff"].(map[string]any)
+	if ok {
+		return summarizeHistoryDiff(diff)
 	}
 
-	raw, _, err := s.client.GetJSON(ctx, fmt.Sprintf("/history/%s/%d", historyKind, id), url.Values{})
-	if err != nil {
-		return nil, nil, err
-	}
-	entries, ok := raw.([]any)
-	if !ok || len(entries) == 0 {
-		return textResult("Nenhuma atividade encontrada para este item.")
-	}
+	return "📝 Modificado"
+}
 
+func historyViews(entries []any) []historyEntryView {
 	views := make([]historyEntryView, 0, len(entries))
 	for _, it := range entries {
 		m, ok := it.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		author := redactName(resolveCommentAuthor(m))
 		if author == "" {
-			author = "—"
+			author = DASH
 		}
-		date := displayValue(m["created_at"])
-		action := ""
-		if comment := strings.TrimSpace(displayValue(m["comment"])); comment != "" {
-			action = "💬 " + comment
-		} else if diff, ok := m["diff"].(map[string]any); ok {
-			action = summarizeHistoryDiff(diff)
-		} else {
-			action = "📝 Modificado"
+
+		views = append(views, historyEntryView{
+			author: author,
+			date:   displayValue(m["created_at"]),
+			action: historyAction(m),
+		})
+	}
+
+	reverse(views)
+	return views
+}
+
+func reverse(views []historyEntryView) {
+	for i := 0; i < len(views)/2; i++ {
+		views[i], views[len(views)-1-i] = views[len(views)-1-i], views[i]
+	}
+}
+
+func (s *Server) listItemActivity(ctx context.Context, input ListActivityInput) (*mcp.CallToolResult, any, error) {
+	kind, id := activityTarget(input)
+	if id <= 0 {
+		return nil, nil, fmt.Errorf("o id do %s deve ser maior que zero", kind)
+	}
+
+	historyKindValue := historyKind(kind)
+
+	itemData, _, err := s.client.GetJSON(ctx, activityEndpoint(kind, id), url.Values{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	subject, ref, status := itemSummary(itemData)
+
+	endpoint := fmt.Sprintf("/history/%s/%d", historyKindValue, id)
+	raw, _, err := s.client.GetJSON(ctx, endpoint, url.Values{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	entries, ok := raw.([]any)
+	if !ok {
+		return textResult("Nenhuma atividade encontrada para este item.")
+	}
+
+	if len(entries) == 0 {
+		return textResult("Nenhuma atividade encontrada para este item.")
+	}
+
+	views := historyViews(entries)
+	if input.Limit != nil {
+		if *input.Limit > 0 {
+			if len(views) > *input.Limit {
+				views = views[:*input.Limit]
+			}
 		}
-		views = append(views, historyEntryView{author: author, date: date, action: action})
 	}
-	for i, j := 0, len(views)-1; i < j; i, j = i+1, j-1 {
-		views[i], views[j] = views[j], views[i]
-	}
-	if input.Limit != nil && *input.Limit > 0 && len(views) > *input.Limit {
-		views = views[:*input.Limit]
-	}
+
 	return textResult(formatHistoryTable(kind, ref, subject, status, views))
 }
 
@@ -215,41 +314,52 @@ func intPtrOrNil(value int) *int {
 	return &value
 }
 
+func setPositiveQuery(query url.Values, key string, value *int) {
+	if value == nil {
+		return
+	}
+	if *value <= 0 {
+		return
+	}
+	query.Set(key, strconv.Itoa(*value))
+}
+
 func (s *Server) fetchRecentItemsWithFilters(ctx context.Context, endpoint, kind string, projectID, limit int, swimlaneID, statusID, assignedTo *int, tags string) []activityItem {
 	query := url.Values{
 		"order_by":  []string{"-modified_date"},
 		"page":      []string{"1"},
 		"page_size": []string{strconv.Itoa(limit)},
 	}
+
 	if projectID > 0 {
 		query.Set("project", strconv.Itoa(projectID))
 	}
-	if assignedTo != nil && *assignedTo > 0 {
-		query.Set("assigned_to", strconv.Itoa(*assignedTo))
-	}
-	if statusID != nil && *statusID > 0 {
-		query.Set("status", strconv.Itoa(*statusID))
-	}
-	if swimlaneID != nil && *swimlaneID > 0 {
-		query.Set("swimlane", strconv.Itoa(*swimlaneID))
-	}
+
+	setPositiveQuery(query, "assigned_to", assignedTo)
+	setPositiveQuery(query, "status", statusID)
+	setPositiveQuery(query, "swimlane", swimlaneID)
+
 	if strings.TrimSpace(tags) != "" {
 		query.Set("tags", strings.TrimSpace(tags))
 	}
+
 	raw, _, err := s.client.ListJSON(ctx, endpoint, query, true)
 	if err != nil {
 		return nil
 	}
+
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
+
 	out := make([]activityItem, 0, len(items))
 	for _, it := range items {
 		m, ok := it.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		out = append(out, activityItem{
 			kind:     kind,
 			id:       displayInt(m["id"]),
@@ -260,11 +370,12 @@ func (s *Server) fetchRecentItemsWithFilters(ctx context.Context, endpoint, kind
 			modified: displayValue(m["modified_date"]),
 		})
 	}
+
 	return out
 }
 
 func (s *Server) enrichActivityActions(ctx context.Context, items []activityItem) {
-	var wg sync.WaitGroup
+	wg := sync.WaitGroup{}
 	for i := range items {
 		wg.Add(1)
 		go func(index int) {
@@ -275,66 +386,105 @@ func (s *Server) enrichActivityActions(ctx context.Context, items []activityItem
 	wg.Wait()
 }
 
-func activityItemsFromTimeline(raw any) []activityItem {
+func timelineItems(raw any) []any {
 	items, ok := raw.([]any)
+	if ok {
+		return items
+	}
+
+	envelope, ok := raw.(map[string]any)
 	if !ok {
-		if envelope, ok := raw.(map[string]any); ok {
-			for _, key := range []string{"events", "activities", "timeline", "results", "data"} {
-				if candidate, ok := envelope[key].([]any); ok {
-					items = candidate
-					break
-				}
-			}
+		return nil
+	}
+
+	for _, key := range []string{"events", "activities", "timeline", "results", "data"} {
+		candidate, ok := envelope[key].([]any)
+		if ok {
+			return candidate
 		}
 	}
+
+	return nil
+}
+
+func timelineKind(kind string) string {
+	if strings.Contains(kind, "issue") {
+		return ISSUE
+	}
+	return CARD
+}
+
+func timelineActor(m map[string]any, actorValue any) string {
+	actor := redactName(displayValue(actorValue))
+	if actor != "" {
+		return actor
+	}
+
+	actorMap, ok := actorValue.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	actor = redactName(displayValue(firstValue(actorMap, "full_name_display", "full_name", "username", "name")))
+	if actor == "objeto" {
+		return ""
+	}
+
+	return actor
+}
+
+func timelineActivity(m map[string]any) activityItem {
+	obj := firstMap(m, "content", "object", "item")
+	if obj == nil {
+		obj = m
+	}
+
+	subject := displayValue(firstValue(obj, "subject", "name", "title"))
+	if subject == "" {
+		subject = displayValue(firstValue(m, "subject", "name", "title"))
+	}
+
+	modified := displayValue(firstValue(m, "created_at", "created_date", "created", "timestamp", "date", "modified_date"))
+	if modified == "" {
+		modified = displayValue(firstValue(obj, "modified_date", "created_date"))
+	}
+
+	action := redactText(displayValue(firstValue(m, "description", "event", "event_type", "verb", "action")))
+	if action == "" {
+		action = "📝 Modificado"
+	}
+
+	return activityItem{
+		kind:     timelineKind(strings.ToLower(firstStringValue(m, "type", "event_type", "content_type"))),
+		id:       displayInt(firstValue(obj, "id")),
+		ref:      displayInt(firstValue(obj, "ref", "reference")),
+		subject:  subject,
+		status:   translateStatus(displayValue(firstValue(obj, "status"))),
+		assigned: timelineActor(m, firstValue(m, "user", "author", "actor", "by")),
+		modified: modified,
+		action:   action,
+	}
+}
+
+func activityItemsFromTimeline(raw any) []activityItem {
+	items := timelineItems(raw)
 	out := make([]activityItem, 0, len(items))
 	for _, item := range items {
 		m, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		obj := firstMap(m, "content", "object", "item")
-		if obj == nil {
-			obj = m
-		}
-		kind := strings.ToLower(firstStringValue(m, "type", "event_type", "content_type"))
-		if strings.Contains(kind, "issue") {
-			kind = "issue"
-		} else {
-			kind = "card"
-		}
-		ref := displayInt(firstValue(obj, "ref", "reference"))
-		subject := displayValue(firstValue(obj, "subject", "name", "title"))
-		if subject == "" {
-			subject = displayValue(firstValue(m, "subject", "name", "title"))
-		}
-		modified := displayValue(firstValue(m, "created_at", "created_date", "created", "timestamp", "date", "modified_date"))
-		if modified == "" {
-			modified = displayValue(firstValue(obj, "modified_date", "created_date"))
-		}
-		actorValue := firstValue(m, "user", "author", "actor", "by")
-		actor := redactName(displayValue(actorValue))
-		if actor == "" {
-			if actorMap, ok := actorValue.(map[string]any); ok {
-				actor = redactName(displayValue(firstValue(actorMap, "full_name_display", "full_name", "username", "name")))
-			}
-		}
-		if actor == "objeto" {
-			actor = ""
-		}
-		action := redactText(displayValue(firstValue(m, "description", "event", "event_type", "verb", "action")))
-		if action == "" {
-			action = "📝 Modificado"
-		}
-		out = append(out, activityItem{kind: kind, id: displayInt(firstValue(obj, "id")), ref: ref, subject: subject, status: translateStatus(displayValue(firstValue(obj, "status"))), assigned: actor, modified: modified, action: action})
+		out = append(out, timelineActivity(m))
 	}
 	return out
 }
 
 func firstValue(m map[string]any, keys ...string) any {
 	for _, key := range keys {
-		if value, ok := m[key]; ok && value != nil {
-			return value
+		if value, ok := m[key]; ok {
+			if value != nil {
+				return value
+			}
 		}
 	}
 	return nil
@@ -357,16 +507,20 @@ func (s *Server) recentProjectActivity(ctx context.Context, projectID, limit int
 	if projectID <= 0 {
 		return nil
 	}
+
 	items := append(
-		s.fetchRecentItemsWithFilters(ctx, "/userstories", "card", projectID, limit, swimlaneID, statusID, assignedTo, tags),
-		s.fetchRecentItemsWithFilters(ctx, "/issues", "issue", projectID, limit, nil, statusID, assignedTo, tags)...,
+		s.fetchRecentItemsWithFilters(ctx, "/userstories", CARD, projectID, limit, swimlaneID, statusID, assignedTo, tags),
+		s.fetchRecentItemsWithFilters(ctx, "/issues", ISSUE, projectID, limit, nil, statusID, assignedTo, tags)...,
 	)
+
 	sort.SliceStable(items, func(i, j int) bool {
 		return parseActivityTime(items[i].modified).After(parseActivityTime(items[j].modified))
 	})
+
 	if len(items) > limit {
 		items = items[:limit]
 	}
+
 	s.enrichActivityActions(ctx, items)
 	return items
 }
@@ -390,7 +544,6 @@ func (s *Server) loadCurrentUser(ctx context.Context) int {
 	}
 	return displayInt(m["id"])
 }
-
 
 type GetInput struct {
 	Entity        string `json:"entity" jsonschema:"Object type: project, card, issue or task"`
@@ -450,8 +603,6 @@ type AttachmentInput struct {
 	Path         string `json:"path,omitempty" jsonschema:"Output path (defaults to the configured directory)"`
 }
 
-
-
 func itemCountLabel(isCard, isIssue bool) string {
 	if isCard {
 		return "cards"
@@ -467,19 +618,181 @@ func listEntityConfig(entity string) (endpoint string, columns map[string]string
 	case "project", "projects":
 		return "/projects", nil, false, false, true, nil
 	case "userstory", "userstories", "card", "cards":
-		return "/userstories", cardColumns, true, false, false, nil
+		return "/userstories", cardColumns(), true, false, false, nil
 	case "issue", "issues":
-		return "/issues", issueColumns, false, true, false, nil
+		return "/issues", issueColumns(), false, true, false, nil
 	case "task", "tasks", "subtask":
-		return "/tasks", taskColumns, false, false, false, nil
+		return "/tasks", taskColumns(), false, false, false, nil
 	default:
 		return "", nil, false, false, false, fmt.Errorf("entidade inválida: %q (use 'project', 'card', 'issue' ou 'task')", entity)
 	}
 }
 
+func (s *Server) listProjects(ctx context.Context, endpoint string, input ListItemsInput) (*mcp.CallToolResult, any, error) {
+	query, paginated, err := paging(input.Page, input.PageSize)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if input.Member != nil {
+		if err := positive("member", *input.Member); err != nil {
+			return nil, nil, err
+		}
+		query.Set("member", strconv.Itoa(*input.Member))
+	}
+
+	if input.CountOnly != nil {
+		if *input.CountOnly {
+			count, err := s.countItems(ctx, endpoint, query)
+			if err != nil {
+				return nil, nil, err
+			}
+			return textResult(fmt.Sprintf("📊 **Total de projetos: %s**\n", formatInt(count)))
+		}
+	}
+
+	data, meta, err := s.client.ListJSON(ctx, endpoint, query, paginated)
+	if err != nil {
+		return nil, nil, err
+	}
+	return textResult(formatProjectsTable(data, meta))
+}
+
+func cardFilters(query url.Values, input ListItemsInput) ([]string, error) {
+	filters := []string{}
+
+	if input.SwimlaneID != nil {
+		if err := positive("swimlane_id", *input.SwimlaneID); err != nil {
+			return nil, err
+		}
+		query.Set("swimlane", strconv.Itoa(*input.SwimlaneID))
+		filters = append(filters, fmt.Sprintf("baia = %d", *input.SwimlaneID))
+	}
+
+	if input.MilestoneID != nil {
+		if err := positive("milestone_id", *input.MilestoneID); err != nil {
+			return nil, err
+		}
+		query.Set("milestone", strconv.Itoa(*input.MilestoneID))
+		filters = append(filters, fmt.Sprintf("marco = %d", *input.MilestoneID))
+	}
+
+	if input.Blocked != nil {
+		query.Set("is_blocked", strconv.FormatBool(*input.Blocked))
+		filters = append(filters, fmt.Sprintf("bloqueado = %v", *input.Blocked))
+	}
+
+	if input.StatusID != nil {
+		filters = append(filters, fmt.Sprintf("status = %d", *input.StatusID))
+	}
+
+	if input.AssignedTo != nil {
+		filters = append(filters, fmt.Sprintf("responsável = %d", *input.AssignedTo))
+	}
+
+	if strings.TrimSpace(input.Tags) != "" {
+		filters = append(filters, fmt.Sprintf("tags = %s", strings.TrimSpace(input.Tags)))
+	}
+
+	if input.Closed != nil {
+		filters = append(filters, fmt.Sprintf("fechado = %v", *input.Closed))
+	}
+
+	return filters, nil
+}
+
+func issueFilters(query url.Values, input ListItemsInput) error {
+	values := []struct {
+		name  string
+		value *int
+	}{
+		{"severity", input.SeverityID},
+		{"priority", input.PriorityID},
+		{"type", input.TypeID},
+	}
+
+	for _, v := range values {
+		if v.value == nil {
+			continue
+		}
+		if err := positive(v.name, *v.value); err != nil {
+			return err
+		}
+		query.Set(v.name, strconv.Itoa(*v.value))
+	}
+
+	return nil
+}
+
+func taskFilters(query url.Values, input ListItemsInput) error {
+	if input.MilestoneID != nil {
+		if err := positive("milestone_id", *input.MilestoneID); err != nil {
+			return err
+		}
+		query.Set("milestone", strconv.Itoa(*input.MilestoneID))
+	}
+
+	if input.UserStoryID != nil {
+		if err := positive("user_story_id", *input.UserStoryID); err != nil {
+			return err
+		}
+		query.Set("user_story", strconv.Itoa(*input.UserStoryID))
+	}
+
+	return nil
+}
+
+func commonFilters(query url.Values, input ListItemsInput) error {
+	if input.StatusID != nil {
+		if err := positive("status_id", *input.StatusID); err != nil {
+			return err
+		}
+		query.Set("status", strconv.Itoa(*input.StatusID))
+	}
+
+	if input.AssignedTo != nil {
+		if err := positive("assigned_to", *input.AssignedTo); err != nil {
+			return err
+		}
+		query.Set("assigned_to", strconv.Itoa(*input.AssignedTo))
+	}
+
+	if strings.TrimSpace(input.Tags) != "" {
+		query.Set("tags", strings.TrimSpace(input.Tags))
+	}
+
+	if input.Closed != nil {
+		query.Set("status__is_closed", strconv.FormatBool(*input.Closed))
+	}
+
+	return nil
+}
+
+func entityFilters(query url.Values, input ListItemsInput, isCard, isIssue bool) ([]string, error) {
+	if isCard {
+		return cardFilters(query, input)
+	}
+
+	if isIssue {
+		return []string{}, issueFilters(query, input)
+	}
+
+	return []string{}, taskFilters(query, input)
+}
+
+func (s *Server) countOnlyResult(ctx context.Context, endpoint string, query url.Values, input ListItemsInput, isCard, isIssue bool, filters []string) (*mcp.CallToolResult, any, error) {
+	count, err := s.countItems(ctx, endpoint, query)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	projectName := s.loadProjectName(ctx, input.ProjectID)
+	return textResult(formatCount(itemCountLabel(isCard, isIssue), count, input.ProjectID, projectName, filters))
+}
+
 func (s *Server) listItems(ctx context.Context, _ *mcp.CallToolRequest, input ListItemsInput) (*mcp.CallToolResult, any, error) {
 	entity := strings.ToLower(strings.TrimSpace(input.Entity))
-	if entity == "activity" || entity == "activities" {
+	if isActivityEntity(entity) {
 		return s.listActivity(ctx, ListActivityInput{
 			ProjectID: intPtrOrNil(input.ProjectID),
 			My:        input.My,
@@ -489,172 +802,104 @@ func (s *Server) listItems(ctx context.Context, _ *mcp.CallToolRequest, input Li
 			TaskID:    input.TaskID,
 		})
 	}
+
 	endpoint, columns, isCard, isIssue, isProject, err := listEntityConfig(entity)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	if isProject {
-		query, paginated, err := paging(input.Page, input.PageSize)
-		if err != nil {
-			return nil, nil, err
-		}
-		if input.Member != nil {
-			if err := positive("member", *input.Member); err != nil {
-				return nil, nil, err
-			}
-			query.Set("member", strconv.Itoa(*input.Member))
-		}
-		if input.CountOnly != nil && *input.CountOnly {
-			count, err := s.countItems(ctx, endpoint, query)
-			if err != nil {
-				return nil, nil, err
-			}
-			return textResult(fmt.Sprintf("📊 **Total de projetos: %s**\n", formatInt(count)))
-		}
-		data, meta, err := s.client.ListJSON(ctx, endpoint, query, paginated)
-		if err != nil {
-			return nil, nil, err
-		}
-		return textResult(formatProjectsTable(data, meta))
+		return s.listProjects(ctx, endpoint, input)
 	}
+
 	if err := positive("project_id", input.ProjectID); err != nil {
 		return nil, nil, err
 	}
+
 	columnKey := normalizeColumn(input.FilterColumn, columns)
-	fetchAll := columnKey != "" && strings.TrimSpace(input.FilterValue) != ""
+	fetchAll := filterRequested(columnKey, input.FilterValue)
+
 	query, paginated, err := listQuery(input.Page, input.PageSize, fetchAll)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	query.Set("project", strconv.Itoa(input.ProjectID))
 
-	if input.StatusID != nil {
-		if err := positive("status_id", *input.StatusID); err != nil {
-			return nil, nil, err
-		}
-		query.Set("status", strconv.Itoa(*input.StatusID))
-	}
-	if input.AssignedTo != nil {
-		if err := positive("assigned_to", *input.AssignedTo); err != nil {
-			return nil, nil, err
-		}
-		query.Set("assigned_to", strconv.Itoa(*input.AssignedTo))
-	}
-	if strings.TrimSpace(input.Tags) != "" {
-		query.Set("tags", strings.TrimSpace(input.Tags))
-	}
-	if input.Closed != nil {
-		query.Set("status__is_closed", strconv.FormatBool(*input.Closed))
+	if err := commonFilters(query, input); err != nil {
+		return nil, nil, err
 	}
 
-	filters := []string{}
-	if isCard {
-		if input.SwimlaneID != nil {
-			if err := positive("swimlane_id", *input.SwimlaneID); err != nil {
-				return nil, nil, err
-			}
-			query.Set("swimlane", strconv.Itoa(*input.SwimlaneID))
-		}
-		if input.MilestoneID != nil {
-			if err := positive("milestone_id", *input.MilestoneID); err != nil {
-				return nil, nil, err
-			}
-			query.Set("milestone", strconv.Itoa(*input.MilestoneID))
-		}
-		if input.Blocked != nil {
-			query.Set("is_blocked", strconv.FormatBool(*input.Blocked))
-		}
-		if input.StatusID != nil {
-			filters = append(filters, fmt.Sprintf("status = %d", *input.StatusID))
-		}
-		if input.SwimlaneID != nil {
-			filters = append(filters, fmt.Sprintf("baia = %d", *input.SwimlaneID))
-		}
-		if input.MilestoneID != nil {
-			filters = append(filters, fmt.Sprintf("marco = %d", *input.MilestoneID))
-		}
-		if input.AssignedTo != nil {
-			filters = append(filters, fmt.Sprintf("responsável = %d", *input.AssignedTo))
-		}
-		if strings.TrimSpace(input.Tags) != "" {
-			filters = append(filters, fmt.Sprintf("tags = %s", strings.TrimSpace(input.Tags)))
-		}
-		if input.Closed != nil {
-			filters = append(filters, fmt.Sprintf("fechado = %v", *input.Closed))
-		}
-		if input.Blocked != nil {
-			filters = append(filters, fmt.Sprintf("bloqueado = %v", *input.Blocked))
-		}
-	} else if isIssue {
-		for name, value := range map[string]*int{
-			"severity": input.SeverityID, "priority": input.PriorityID, "type": input.TypeID,
-		} {
-			if value != nil {
-				if err := positive(name, *value); err != nil {
-					return nil, nil, err
-				}
-				query.Set(name, strconv.Itoa(*value))
-			}
-		}
-	} else {
-		if input.MilestoneID != nil {
-			if err := positive("milestone_id", *input.MilestoneID); err != nil {
-				return nil, nil, err
-			}
-			query.Set("milestone", strconv.Itoa(*input.MilestoneID))
-		}
-		if input.UserStoryID != nil {
-			if err := positive("user_story_id", *input.UserStoryID); err != nil {
-				return nil, nil, err
-			}
-			query.Set("user_story", strconv.Itoa(*input.UserStoryID))
-		}
+	filters, err := entityFilters(query, input, isCard, isIssue)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if input.CountOnly != nil && *input.CountOnly {
-		count, err := s.countItems(ctx, endpoint, query)
-		if err != nil {
-			return nil, nil, err
+	if input.CountOnly != nil {
+		if *input.CountOnly {
+			return s.countOnlyResult(ctx, endpoint, query, input, isCard, isIssue, filters)
 		}
-		projectName := ""
-		if proj, _, perr := s.client.GetJSON(ctx, "/projects/"+strconv.Itoa(input.ProjectID), url.Values{}); perr == nil {
-			if m, ok := proj.(map[string]any); ok {
-				projectName = displayValue(m["name"])
-			}
-		}
-		return textResult(formatCount(itemCountLabel(isCard, isIssue), count, input.ProjectID, projectName, filters))
 	}
 
 	data, meta, err := s.client.ListJSON(ctx, endpoint, query, paginated)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	if fetchAll {
-		filtered, total := filterRows(data, columnKey, input.FilterValue)
-		slice, _ := filtered.([]any)
-		if len(slice) > displayCap {
-			slice = slice[:displayCap]
-		}
-		footer := fmt.Sprintf("🔎 %d correspondências para %q (exibindo até %d).", total, input.FilterValue, displayCap)
-		switch {
-		case isCard:
-			return textResult(formatCardsTable(slice, taiga.ResponseMeta{}) + "\n" + footer)
-		case isIssue:
-			priorities, severities := s.loadIssueValues(ctx, input.ProjectID)
-			return textResult(formatIssuesTable(slice, taiga.ResponseMeta{}, priorities, severities) + "\n" + footer)
-		default:
-			return textResult(formatTasksTable(slice, taiga.ResponseMeta{}) + "\n" + footer)
-		}
+		return s.filteredResult(ctx, data, input, columnKey, isCard, isIssue)
 	}
-	switch {
-	case isCard:
+
+	if isCard {
 		return textResult(formatCardsTable(data, meta))
-	case isIssue:
+	}
+
+	if isIssue {
 		priorities, severities := s.loadIssueValues(ctx, input.ProjectID)
 		return textResult(formatIssuesTable(data, meta, priorities, severities))
-	default:
-		return textResult(formatTasksTable(data, meta))
 	}
+
+	return textResult(formatTasksTable(data, meta))
+}
+
+func isActivityEntity(entity string) bool {
+	if entity == "activity" {
+		return true
+	}
+	return entity == "activities"
+}
+
+func filterRequested(columnKey, value string) bool {
+	if columnKey == "" {
+		return false
+	}
+	return strings.TrimSpace(value) != ""
+}
+
+func (s *Server) filteredResult(ctx context.Context, data any, input ListItemsInput, columnKey string, isCard, isIssue bool) (*mcp.CallToolResult, any, error) {
+	filtered, total := filterRows(data, columnKey, input.FilterValue)
+
+	slice, ok := filtered.([]any)
+	if !ok {
+		slice = []any{}
+	}
+
+	if len(slice) > DISPLAY_CAP {
+		slice = slice[:DISPLAY_CAP]
+	}
+
+	footer := fmt.Sprintf("🔎 %d correspondências para %q (exibindo até %d).", total, input.FilterValue, DISPLAY_CAP)
+
+	if isCard {
+		return textResult(fmt.Sprintf("%s\n%s", formatCardsTable(slice, taiga.ResponseMeta{}), footer))
+	}
+
+	if isIssue {
+		priorities, severities := s.loadIssueValues(ctx, input.ProjectID)
+		return textResult(fmt.Sprintf("%s\n%s", formatIssuesTable(slice, taiga.ResponseMeta{}, priorities, severities), footer))
+	}
+
+	return textResult(fmt.Sprintf("%s\n%s", formatTasksTable(slice, taiga.ResponseMeta{}), footer))
 }
 
 func (s *Server) countItems(ctx context.Context, endpoint string, query url.Values) (int, error) {
@@ -664,21 +909,27 @@ func (s *Server) countItems(ctx context.Context, endpoint string, query url.Valu
 	}
 	paged.Set("page", "1")
 	paged.Set("page_size", "1")
+
 	if raw, meta, err := s.client.ListJSON(ctx, endpoint, paged, true); err == nil {
 		if meta.Total != "" {
-			if total, perr := strconv.Atoi(strings.TrimSpace(meta.Total)); perr == nil {
+			total, perr := strconv.Atoi(strings.TrimSpace(meta.Total))
+			if perr == nil {
 				return total, nil
 			}
 		}
+
 		if items, ok := raw.([]any); ok {
 			return len(items), nil
 		}
 	}
-	if raw, _, err := s.client.ListJSON(ctx, endpoint, query, false); err == nil {
+
+	raw, _, err := s.client.ListJSON(ctx, endpoint, query, false)
+	if err == nil {
 		if items, ok := raw.([]any); ok {
 			return len(items), nil
 		}
 	}
+
 	return 0, nil
 }
 
@@ -695,93 +946,142 @@ func itemKinds(entity string) (commentKind, attachKind string, isCard, isIssue, 
 	}
 }
 
+func projectTarget(input GetInput) (string, url.Values, error) {
+	if input.ProjectID != nil {
+		if err := positive("project_id", *input.ProjectID); err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("/projects/%d", *input.ProjectID), url.Values{}, nil
+	}
+
+	return "/projects/by_slug", url.Values{"slug": []string{strings.TrimSpace(input.Slug)}}, nil
+}
+
+func projectActivityLimit(input GetInput) int {
+	if input.ActivityLimit == nil {
+		return DEFAULT_PROJECT_ACTIVES
+	}
+
+	if *input.ActivityLimit <= 0 {
+		return DEFAULT_PROJECT_ACTIVES
+	}
+
+	if *input.ActivityLimit > MAX_PROJECT_ACTIVES {
+		return MAX_PROJECT_ACTIVES
+	}
+
+	return *input.ActivityLimit
+}
+
+func (s *Server) getProject(ctx context.Context, input GetInput) (*mcp.CallToolResult, any, error) {
+	hasProjectID := input.ProjectID != nil
+	hasSlug := strings.TrimSpace(input.Slug) != ""
+	if hasProjectID == hasSlug {
+		return nil, nil, errors.New("informe exatamente um de project_id ou slug")
+	}
+
+	endpoint, query, err := projectTarget(input)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	data, _, err := s.client.GetJSON(ctx, endpoint, query)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	projectID := extractIntField(data, "id")
+	if input.ProjectID != nil {
+		projectID = *input.ProjectID
+	}
+
+	limit := projectActivityLimit(input)
+	activities := s.recentProjectActivity(ctx, projectID, limit, input.SwimlaneID, input.StatusID, input.AssignedTo, input.Tags)
+	return textResult(formatProject(data, activities))
+}
+
+func itemEndpoint(base string, input GetInput) (string, url.Values, error) {
+	if input.ID != nil {
+		if err := positive("id", *input.ID); err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("%s/%d", base, *input.ID), url.Values{}, nil
+	}
+
+	if err := positive("ref", *input.Ref); err != nil {
+		return "", nil, err
+	}
+
+	if input.ProjectID == nil {
+		return "", nil, errors.New("project_id é obrigatório quando ref for usado")
+	}
+
+	if err := positive("project_id", *input.ProjectID); err != nil {
+		return "", nil, err
+	}
+
+	query := url.Values{}
+	query.Set("ref", strconv.Itoa(*input.Ref))
+	query.Set("project", strconv.Itoa(*input.ProjectID))
+	return fmt.Sprintf("%s/by_ref", base), query, nil
+}
+
+func isProjectEntity(entity string) bool {
+	if entity == "project" {
+		return true
+	}
+	return entity == "projects"
+}
+
 func (s *Server) get(ctx context.Context, _ *mcp.CallToolRequest, input GetInput) (*mcp.CallToolResult, any, error) {
 	entity := strings.ToLower(strings.TrimSpace(input.Entity))
 
-	if entity == "project" || entity == "projects" {
-		if (input.ProjectID == nil) == (strings.TrimSpace(input.Slug) == "") {
-			return nil, nil, errors.New("informe exatamente um de project_id ou slug")
-		}
-		var endpoint string
-		var query url.Values
-		if input.ProjectID != nil {
-			if err := positive("project_id", *input.ProjectID); err != nil {
-				return nil, nil, err
-			}
-			endpoint = "/projects/" + strconv.Itoa(*input.ProjectID)
-			query = url.Values{}
-		} else {
-			endpoint = "/projects/by_slug"
-			query = url.Values{"slug": []string{strings.TrimSpace(input.Slug)}}
-		}
-		data, _, err := s.client.GetJSON(ctx, endpoint, query)
-		if err != nil {
-			return nil, nil, err
-		}
-		projectID := extractIntField(data, "id")
-		if input.ProjectID != nil {
-			projectID = *input.ProjectID
-		}
-		activityLimit := 5
-		if input.ActivityLimit != nil && *input.ActivityLimit > 0 {
-			activityLimit = *input.ActivityLimit
-			if activityLimit > 20 {
-				activityLimit = 20
-			}
-		}
-		activities := s.recentProjectActivity(ctx, projectID, activityLimit, input.SwimlaneID, input.StatusID, input.AssignedTo, input.Tags)
-		return textResult(formatProject(data, activities))
+	if isProjectEntity(entity) {
+		return s.getProject(ctx, input)
 	}
 
 	if (input.ID == nil) == (input.Ref == nil) {
 		return nil, nil, errors.New("informe exatamente um de id ou ref")
 	}
+
 	base, _, _, err := itemBase(entity)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	commentKind, attachKind, isCard, isIssue, isTask, err := itemKinds(entity)
 	if err != nil {
 		return nil, nil, err
 	}
-	var endpoint string
-	query := url.Values{}
-	if input.ID != nil {
-		if err := positive("id", *input.ID); err != nil {
-			return nil, nil, err
-		}
-		endpoint = base + "/" + strconv.Itoa(*input.ID)
-	} else {
-		if err := positive("ref", *input.Ref); err != nil {
-			return nil, nil, err
-		}
-		if input.ProjectID == nil {
-			return nil, nil, errors.New("project_id é obrigatório quando ref for usado")
-		}
-		if err := positive("project_id", *input.ProjectID); err != nil {
-			return nil, nil, err
-		}
-		endpoint = base + "/by_ref"
-		query.Set("ref", strconv.Itoa(*input.Ref))
-		query.Set("project", strconv.Itoa(*input.ProjectID))
+
+	endpoint, query, err := itemEndpoint(base, input)
+	if err != nil {
+		return nil, nil, err
 	}
+
 	data, _, err := s.client.GetJSON(ctx, endpoint, query)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	comments := s.loadComments(ctx, commentKind, extractID(data))
 	attachments := s.loadAttachmentNames(ctx, attachKind, extractIntField(data, "project"), extractID(data))
+
 	if isTask {
 		return textResult(formatTaskItem(data, comments, attachments))
 	}
-	var subtasks []string
+
+	subtasks := []string(nil)
 	if isCard {
 		subtasks = s.loadSubtasks(ctx, extractIntField(data, "project"), extractID(data))
 	}
-	var priorities, severities map[int]string
+
+	priorities := map[int]string(nil)
+	severities := map[int]string(nil)
 	if isIssue {
 		priorities, severities = s.loadIssueValues(ctx, extractIntField(data, "project"))
 	}
+
 	return textResult(formatDetailedItem(data, comments, attachments, subtasks, priorities, severities))
 }
 
@@ -795,39 +1095,34 @@ func (s *Server) fetchItem(ctx context.Context, base string, itemID, refValue, p
 	if (itemID == nil) == (refValue == nil) {
 		return nil, errors.New("informe exatamente um de id ou ref")
 	}
-	endpoint := ""
-	query := url.Values{}
-	if itemID != nil {
-		if err := positive("id", *itemID); err != nil {
-			return nil, err
-		}
-		endpoint = "/" + base + "/" + strconv.Itoa(*itemID)
-	} else {
-		if err := positive("ref", *refValue); err != nil {
-			return nil, err
-		}
-		if projectValue == nil {
-			return nil, errors.New("project_id é obrigatório quando ref for usado")
-		}
-		if err := positive("project_id", *projectValue); err != nil {
-			return nil, err
-		}
-		endpoint = "/" + base + "/by_ref"
-		query.Set("ref", strconv.Itoa(*refValue))
-		query.Set("project", strconv.Itoa(*projectValue))
+
+	endpoint, query, err := itemEndpoint(base, GetInput{
+		ID:        itemID,
+		Ref:       refValue,
+		ProjectID: projectValue,
+	})
+	if err != nil {
+		return nil, err
 	}
+
 	raw, _, err := s.client.GetJSON(ctx, endpoint, query)
 	if err != nil {
 		return nil, err
 	}
-	obj, _ := raw.(map[string]any)
+
 	id := extractID(raw)
 	if id <= 0 {
 		return nil, errors.New("não foi possível identificar o item")
 	}
+
 	version := extractIntField(raw, "version")
 	if version <= 0 {
 		return nil, errors.New("não foi possível obter a versão do item (campo version)")
+	}
+
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		obj = map[string]any{}
 	}
 	return &resolvedItem{obj: obj, id: id, version: version}, nil
 }
@@ -836,26 +1131,37 @@ func (s *Server) applyStatusChange(ctx context.Context, kind, base string, itemI
 	if err := positive("status_id", statusID); err != nil {
 		return nil, nil, err
 	}
+
 	item, err := s.fetchItem(ctx, base, itemID, refValue, projectValue)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	beforeObj := item.obj
 	oldStatus := translateStatus(resolveName(beforeObj, "status"))
+
 	ref := displayInt(beforeObj["ref"])
 	if ref == 0 {
 		ref = item.id
 	}
+
 	subject := redactText(displayValue(beforeObj["subject"]))
 
-	after, _, err := s.client.PatchJSON(ctx, "/"+base+"/"+strconv.Itoa(item.id), nil, map[string]any{"status": statusID, "version": item.version})
+	endpoint := fmt.Sprintf("%s/%d", base, item.id)
+	body := map[string]any{"status": statusID, "version": item.version}
+
+	after, _, err := s.client.PatchJSON(ctx, endpoint, nil, body)
 	if err != nil {
 		return nil, nil, err
 	}
-	afterObj, _ := after.(map[string]any)
+
+	afterObj, ok := after.(map[string]any)
+	if !ok {
+		afterObj = map[string]any{}
+	}
 	newStatus := translateStatus(resolveName(afterObj, "status"))
 
-	var b strings.Builder
+	b := strings.Builder{}
 	fmt.Fprintf(&b, "✅ %s #%d: **%s**\n\n", kind, ref, subject)
 	fmt.Fprintf(&b, "- **Status:** %s → **%s**\n", oldStatus, newStatus)
 	fmt.Fprintf(&b, "- **%s:** %d\n", idLabel, item.id)
@@ -899,56 +1205,70 @@ type searchRow struct {
 	project  string
 }
 
-func (s *Server) search(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
-	q := strings.ToLower(strings.TrimSpace(input.Query))
-	if q == "" {
-		return nil, nil, errors.New("'query' é obrigatório")
-	}
-	limit := 10
-	if input.Limit != nil && *input.Limit > 0 {
-		limit = *input.Limit
-		if limit > 30 {
-			limit = 30
-		}
-	}
-	query := url.Values{}
-	if input.ProjectID != nil {
-		if err := positive("project_id", *input.ProjectID); err != nil {
-			return nil, nil, err
-		}
-		query.Set("project", strconv.Itoa(*input.ProjectID))
+func searchLimit(input SearchInput) int {
+	if input.Limit == nil {
+		return DEFAULT_SEARCH_LIMIT
 	}
 
-	rows := make([]searchRow, 0, limit)
-	for _, bucket := range []struct{ kind, path string }{
+	if *input.Limit <= 0 {
+		return DEFAULT_SEARCH_LIMIT
+	}
+
+	if *input.Limit > MAX_SEARCH_LIMIT {
+		return MAX_SEARCH_LIMIT
+	}
+
+	return *input.Limit
+}
+
+func searchBuckets() []struct{ kind, path string } {
+	return []struct{ kind, path string }{
 		{"Card", "/userstories"},
 		{"Issue", "/issues"},
 		{"Task", "/tasks"},
-	} {
+	}
+}
+
+func matchesQuery(m map[string]any, q string) bool {
+	subject := strings.ToLower(displayValue(m["subject"]))
+	refNo := displayValue(m["ref"])
+	if strings.Contains(subject, q) {
+		return true
+	}
+	return strings.EqualFold(refNo, q)
+}
+
+func (s *Server) searchBuckets(ctx context.Context, query url.Values, q string, limit int) []searchRow {
+	rows := make([]searchRow, 0, limit)
+	for _, bucket := range searchBuckets() {
 		if len(rows) >= limit {
 			break
 		}
+
 		data, _, err := s.client.ListJSON(ctx, bucket.path, query, false)
 		if err != nil {
 			continue
 		}
+
 		items, ok := data.([]any)
 		if !ok {
 			continue
 		}
+
 		for _, item := range items {
 			if len(rows) >= limit {
 				break
 			}
+
 			m, ok := item.(map[string]any)
 			if !ok {
 				continue
 			}
-			subject := strings.ToLower(displayValue(m["subject"]))
-			refNo := displayValue(m["ref"])
-			if !strings.Contains(subject, q) && !strings.EqualFold(refNo, q) {
+
+			if !matchesQuery(m, q) {
 				continue
 			}
+
 			rows = append(rows, searchRow{
 				kind:     bucket.kind,
 				id:       displayInt(m["id"]),
@@ -961,74 +1281,116 @@ func (s *Server) search(ctx context.Context, _ *mcp.CallToolRequest, input Searc
 		}
 	}
 
-	rawQuery := strings.TrimSpace(input.Query)
+	return rows
+}
+
+func formatSearchResult(rows []searchRow, rawQuery string, limit int) (*mcp.CallToolResult, any, error) {
 	if len(rows) == 0 {
 		return textResult(fmt.Sprintf("🔎 Nenhum resultado para %q.", rawQuery))
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	fmt.Fprintf(&b, "🔎 **%d resultado(s)** para %q\n\n", len(rows), rawQuery)
 	b.WriteString("| Tipo | id | Ref | Assunto | Status | Responsável | Projeto |\n")
 	b.WriteString("|------|----|-----|--------|--------|-------------|---------|\n")
+
 	for _, r := range rows {
-		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n", r.kind, strconv.Itoa(r.id), strconv.Itoa(r.ref), r.subject, r.status, r.assigned, r.project)
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n",
+			r.kind, strconv.Itoa(r.id), strconv.Itoa(r.ref), r.subject, r.status, r.assigned, r.project)
 	}
+
 	if len(rows) == limit {
 		fmt.Fprintf(&b, "\n_(primeiros %d resultados; use taiga_get com o id para abrir)_\n", limit)
 	}
+
 	return textResult(b.String())
 }
 
+func (s *Server) search(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
+	q := strings.ToLower(strings.TrimSpace(input.Query))
+	if q == "" {
+		return nil, nil, errors.New("'query' é obrigatório")
+	}
 
+	query := url.Values{}
+	if input.ProjectID != nil {
+		if err := positive("project_id", *input.ProjectID); err != nil {
+			return nil, nil, err
+		}
+		query.Set("project", strconv.Itoa(*input.ProjectID))
+	}
 
+	limit := searchLimit(input)
+	rows := s.searchBuckets(ctx, query, q, limit)
+	return formatSearchResult(rows, strings.TrimSpace(input.Query), limit)
+}
 
+func (s *Server) listAttachments(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
+	if err := positive("project_id", input.ProjectID); err != nil {
+		return nil, nil, err
+	}
+
+	if err := positive("object_id", input.ObjectID); err != nil {
+		return nil, nil, err
+	}
+
+	query := url.Values{
+		"project":   []string{strconv.Itoa(input.ProjectID)},
+		"object_id": []string{strconv.Itoa(input.ObjectID)},
+	}
+
+	data, _, err := s.client.ListJSON(ctx, fmt.Sprintf("%s/attachments", endpoint), query, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return textResult(formatAttachmentsTable(data))
+}
+
+func (s *Server) downloadAttachment(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
+	if err := positive("attachment_id", input.AttachmentID); err != nil {
+		return nil, nil, err
+	}
+
+	data, _, err := s.client.GetJSON(ctx, fmt.Sprintf("%s/attachments/%d", endpoint, input.AttachmentID), url.Values{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	attachment, ok := data.(map[string]any)
+	if !ok {
+		return nil, nil, errors.New("resposta do Taiga para o anexo não é um objeto JSON")
+	}
+
+	rawURL := firstString(attachment, "url", "attached_file", "file_url")
+	if rawURL == "" {
+		return nil, nil, errors.New("o anexo não contém uma URL de download")
+	}
+
+	filename := strings.TrimSpace(input.Filename)
+	if filename == "" {
+		filename = firstString(attachment, "name", "filename", "file_name", "attached_file")
+	}
+
+	result, err := s.client.Download(ctx, rawURL, filename, input.Path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return textResult(formatDownload(result))
+}
 
 func (s *Server) attachment(ctx context.Context, _ *mcp.CallToolRequest, input AttachmentInput) (*mcp.CallToolResult, any, error) {
 	endpoint, err := attachmentEndpoint(input.Entity)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	switch strings.ToLower(strings.TrimSpace(input.Action)) {
 	case "list":
-		if err := positive("project_id", input.ProjectID); err != nil {
-			return nil, nil, err
-		}
-		if err := positive("object_id", input.ObjectID); err != nil {
-			return nil, nil, err
-		}
-		query := url.Values{
-			"project":   []string{strconv.Itoa(input.ProjectID)},
-			"object_id": []string{strconv.Itoa(input.ObjectID)},
-		}
-		data, _, err := s.client.ListJSON(ctx, endpoint+"/attachments", query, false)
-		if err != nil {
-			return nil, nil, err
-		}
-		return textResult(formatAttachmentsTable(data))
+		return s.listAttachments(ctx, endpoint, input)
 	case "download":
-		if err := positive("attachment_id", input.AttachmentID); err != nil {
-			return nil, nil, err
-		}
-		data, _, err := s.client.GetJSON(ctx, endpoint+"/attachments/"+strconv.Itoa(input.AttachmentID), url.Values{})
-		if err != nil {
-			return nil, nil, err
-		}
-		attachment, ok := data.(map[string]any)
-		if !ok {
-			return nil, nil, errors.New("resposta do Taiga para o anexo não é um objeto JSON")
-		}
-		rawURL := firstString(attachment, "url", "attached_file", "file_url")
-		if rawURL == "" {
-			return nil, nil, errors.New("o anexo não contém uma URL de download")
-		}
-		filename := strings.TrimSpace(input.Filename)
-		if filename == "" {
-			filename = firstString(attachment, "name", "filename", "file_name", "attached_file")
-		}
-		result, err := s.client.Download(ctx, rawURL, filename, input.Path)
-		if err != nil {
-			return nil, nil, err
-		}
-		return textResult(formatDownload(result))
+		return s.downloadAttachment(ctx, endpoint, input)
 	default:
 		return nil, nil, errors.New("action deve ser 'list' ou 'download'")
 	}
@@ -1047,12 +1409,21 @@ func attachmentEndpoint(entity string) (string, error) {
 	}
 }
 
+func nestedString(m map[string]any, key string) string {
+	v, ok := m[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}
+
 func firstString(object map[string]any, keys ...string) string {
 	for _, key := range keys {
 		value, ok := object[key]
 		if !ok {
 			continue
 		}
+
 		switch typed := value.(type) {
 		case string:
 			if strings.TrimSpace(typed) != "" {
@@ -1060,8 +1431,9 @@ func firstString(object map[string]any, keys ...string) string {
 			}
 		case map[string]any:
 			for _, nestedKey := range []string{"url", "name", "filename"} {
-				if nested, ok := typed[nestedKey].(string); ok && strings.TrimSpace(nested) != "" {
-					return strings.TrimSpace(nested)
+				nested := nestedString(typed, nestedKey)
+				if nested != "" {
+					return nested
 				}
 			}
 		}
@@ -1077,13 +1449,23 @@ func paging(page, pageSize *int) (url.Values, bool, error) {
 		}
 		query.Set("page", strconv.Itoa(*page))
 	}
+
 	if pageSize != nil {
-		if *pageSize < 1 || *pageSize > 1000 {
+		if *pageSize < 1 {
+			return nil, false, errors.New("page_size deve estar entre 1 e 1000")
+		}
+		if *pageSize > MAX_PAGE_SIZE {
 			return nil, false, errors.New("page_size deve estar entre 1 e 1000")
 		}
 		query.Set("page_size", strconv.Itoa(*pageSize))
 	}
-	return query, page != nil || pageSize != nil, nil
+
+	paginatedRequest := page != nil
+	if !paginatedRequest {
+		paginatedRequest = pageSize != nil
+	}
+
+	return query, paginatedRequest, nil
 }
 
 func positive(name string, value int) error {
@@ -1099,19 +1481,19 @@ func textResult(text string) (*mcp.CallToolResult, any, error) {
 	}, nil, nil
 }
 
-const defaultListLimit = 50
-
-const displayCap = 50
-
 func listQuery(page, pageSize *int, fetchAll bool) (url.Values, bool, error) {
 	if fetchAll {
 		return paging(nil, nil)
 	}
+
 	effectivePageSize := pageSize
-	if page == nil && pageSize == nil {
-		d := defaultListLimit
-		effectivePageSize = &d
+	if page == nil {
+		if pageSize == nil {
+			d := DEFAULT_LIST_LIMIT
+			effectivePageSize = &d
+		}
 	}
+
 	return paging(page, effectivePageSize)
 }
 
@@ -1128,6 +1510,7 @@ func filterRows(data any, columnKey, value string) (any, int) {
 	if !ok {
 		return data, 0
 	}
+
 	needle := strings.ToLower(strings.TrimSpace(value))
 	out := make([]any, 0, len(items))
 	for _, it := range items {
@@ -1139,97 +1522,102 @@ func filterRows(data any, columnKey, value string) (any, int) {
 			out = append(out, it)
 		}
 	}
+
 	return out, len(out)
 }
 
-var cardColumns = map[string]string{
-	"id":            "id",
-	"ref":           "ref",
-	"assunto":       "subject",
-	"subject":       "subject",
-	"status":        "status",
-	"bloqueado":     "is_blocked",
-	"is_blocked":    "is_blocked",
-	"responsável":   "assigned_to",
-	"responsavel":   "assigned_to",
-	"assigned_to":   "assigned_to",
-	"fechado":       "is_closed",
-	"is_closed":     "is_closed",
-	"modificado":    "modified_date",
-	"modificado em": "modified_date",
-	"modified_date": "modified_date",
+func cardColumns() map[string]string {
+	return map[string]string{
+		"id":            "id",
+		"ref":           "ref",
+		"assunto":       "subject",
+		"subject":       "subject",
+		"status":        "status",
+		"bloqueado":     "is_blocked",
+		"is_blocked":    "is_blocked",
+		"responsável":   "assigned_to",
+		"responsavel":   "assigned_to",
+		"assigned_to":   "assigned_to",
+		"fechado":       "is_closed",
+		"is_closed":     "is_closed",
+		"modificado":    "modified_date",
+		"modificado em": "modified_date",
+		"modified_date": "modified_date",
+	}
 }
 
-var issueColumns = map[string]string{
-	"id":            "id",
-	"ref":           "ref",
-	"assunto":       "subject",
-	"subject":       "subject",
-	"status":        "status",
-	"responsável":   "assigned_to",
-	"responsavel":   "assigned_to",
-	"assigned_to":   "assigned_to",
-	"prioridade":    "priority",
-	"priority":      "priority",
-	"severidade":    "severity",
-	"severity":      "severity",
-	"fechado":       "is_closed",
-	"is_closed":     "is_closed",
-	"modificado":    "modified_date",
-	"modificado em": "modified_date",
-	"modified_date": "modified_date",
+func issueColumns() map[string]string {
+	return map[string]string{
+		"id":            "id",
+		"ref":           "ref",
+		"assunto":       "subject",
+		"subject":       "subject",
+		"status":        "status",
+		"responsável":   "assigned_to",
+		"responsavel":   "assigned_to",
+		"assigned_to":   "assigned_to",
+		"prioridade":    "priority",
+		"priority":      "priority",
+		"severidade":    "severity",
+		"severity":      "severity",
+		"fechado":       "is_closed",
+		"is_closed":     "is_closed",
+		"modificado":    "modified_date",
+		"modificado em": "modified_date",
+		"modified_date": "modified_date",
+	}
 }
 
-var taskColumns = map[string]string{
-	"id":            "id",
-	"ref":           "ref",
-	"assunto":       "subject",
-	"subject":       "subject",
-	"status":        "status",
-	"responsável":   "assigned_to",
-	"responsavel":   "assigned_to",
-	"assigned_to":   "assigned_to",
-	"fechado":       "is_closed",
-	"is_closed":     "is_closed",
-	"modificado":    "modified_date",
-	"modificado em": "modified_date",
-	"modified_date": "modified_date",
+func taskColumns() map[string]string {
+	return map[string]string{
+		"id":            "id",
+		"ref":           "ref",
+		"assunto":       "subject",
+		"subject":       "subject",
+		"status":        "status",
+		"responsável":   "assigned_to",
+		"responsavel":   "assigned_to",
+		"assigned_to":   "assigned_to",
+		"fechado":       "is_closed",
+		"is_closed":     "is_closed",
+		"modificado":    "modified_date",
+		"modificado em": "modified_date",
+		"modified_date": "modified_date",
+	}
 }
 
 func extractID(data any) int {
-	m, ok := data.(map[string]any)
-	if !ok {
-		return 0
-	}
-	if f, ok := m["id"].(float64); ok {
-		return int(f)
-	}
-	return 0
+	return extractIntField(data, "id")
 }
 
 func (s *Server) loadComments(ctx context.Context, kind string, id int) []commentView {
 	if id == 0 {
 		return nil
 	}
+
 	endpoint := fmt.Sprintf("/history/%s/%d", kind, id)
 	raw, _, err := s.client.GetJSON(ctx, endpoint, url.Values{})
 	if err != nil {
 		return nil
 	}
+
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
+
 	out := make([]commentView, 0, len(items))
 	for _, it := range items {
 		m, ok := it.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		text := strings.TrimSpace(displayValue(m["comment"]))
 		if text == "" {
 			continue
 		}
+
 		out = append(out, commentView{
 			author: resolveCommentAuthor(m),
 			date:   displayValue(m["created_at"]),
@@ -1240,10 +1628,12 @@ func (s *Server) loadComments(ctx context.Context, kind string, id int) []commen
 }
 
 func resolveCommentAuthor(m map[string]any) string {
-	if extra, ok := m["user_extra_info"].(map[string]any); ok {
+	extra, ok := m["user_extra_info"].(map[string]any)
+	if ok {
 		for _, key := range []string{"full_name_display", "username", "name"} {
-			if v, ok := extra[key].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
+			v := nestedString(extra, key)
+			if v != "" {
+				return v
 			}
 		}
 	}
@@ -1254,87 +1644,115 @@ func (s *Server) loadLastAction(ctx context.Context, kind string, id int) string
 	if id == 0 {
 		return ""
 	}
-	historyKind := kind
-	if historyKind == "card" {
-		historyKind = "userstory"
-	}
-	endpoint := fmt.Sprintf("/history/%s/%d", historyKind, id)
+
+	endpoint := fmt.Sprintf("/history/%s/%d", historyKind(kind), id)
 	raw, _, err := s.client.GetJSON(ctx, endpoint, url.Values{})
 	if err != nil {
 		return ""
 	}
+
 	items, ok := raw.([]any)
-	if !ok || len(items) == 0 {
+	if !ok {
 		return ""
 	}
+
+	if len(items) == 0 {
+		return ""
+	}
+
 	latest, ok := items[len(items)-1].(map[string]any)
 	if !ok {
 		return ""
 	}
+
 	userName := redactName(resolveCommentAuthor(latest))
 	if userName == "" {
-		userName = "—"
+		userName = DASH
 	}
-	if comment := strings.TrimSpace(displayValue(latest["comment"])); comment != "" {
+
+	comment := strings.TrimSpace(displayValue(latest["comment"]))
+	if comment != "" {
 		return fmt.Sprintf("💬 %s comentou", userName)
 	}
-	if diff, ok := latest["diff"].(map[string]any); ok {
+
+	diff, ok := latest["diff"].(map[string]any)
+	if ok {
 		return summarizeHistoryDiff(diff)
 	}
+
 	return "📝 Modificado"
+}
+
+func historyFieldLabel(field string) string {
+	labels := map[string]string{
+		"status": "o status", "assigned_to": "o responsável",
+		"assigned_users": "os responsáveis", "swimlane": "a baia",
+		"tags": "as tags", "description": "a descrição",
+		"description_html": "a descrição", "subject": "o assunto",
+		"attachments": "um anexo", "due_date": "a data de vencimento",
+		"milestone": "o marco", "points": "os pontos",
+	}
+	return labels[field]
+}
+
+func historyFieldAction(field, label, value string) string {
+	switch field {
+	case "attachments":
+		return "adicionou um anexo"
+	case "subject":
+		return "alterou o assunto"
+	default:
+		newValue := value
+		if field == "status" {
+			newValue = translateStatus(value)
+		}
+		if newValue != "" {
+			return fmt.Sprintf("alterou %s para %s", label, redactText(newValue))
+		}
+		return fmt.Sprintf("alterou %s", label)
+	}
 }
 
 func summarizeHistoryDiff(diff map[string]any) string {
 	fields := make([]string, 0, len(diff))
 	descriptionChanged := false
+
 	for field, value := range diff {
-		label := map[string]string{
-			"status": "o status", "assigned_to": "o responsável",
-			"assigned_users": "os responsáveis", "swimlane": "a baia",
-			"tags": "as tags", "description": "a descrição",
-			"description_html": "a descrição", "subject": "o assunto",
-			"attachments": "um anexo", "due_date": "a data de vencimento",
-			"milestone": "o marco", "points": "os pontos",
-		}[field]
+		label := historyFieldLabel(field)
 		if label == "" {
 			continue
 		}
-		if field == "attachments" {
-			fields = append(fields, "adicionou um anexo")
-			continue
-		}
-		if field == "description" || field == "description_html" {
+
+		if field == "description" {
 			descriptionChanged = true
 			continue
 		}
-		if field == "subject" {
-			fields = append(fields, "alterou o assunto")
+
+		if field == "description_html" {
+			descriptionChanged = true
 			continue
 		}
-		newValue := historyNewValue(value)
-		if field == "status" && newValue != "" {
-			newValue = translateStatus(newValue)
-		}
-		if newValue != "" {
-			fields = append(fields, fmt.Sprintf("alterou %s para %s", label, redactText(newValue)))
-		} else {
-			fields = append(fields, "alterou "+label)
-		}
+
+		fields = append(fields, historyFieldAction(field, label, historyNewValue(value)))
 	}
+
 	if descriptionChanged {
 		fields = append(fields, "alterou a descrição")
 	}
+
 	if len(fields) == 0 {
 		return "📝 Atualizou o card"
 	}
-	return "✏️ " + strings.Join(fields, "; ")
+
+	return fmt.Sprintf("✏️ %s", strings.Join(fields, "; "))
 }
 
 func historyNewValue(value any) string {
 	switch typed := value.(type) {
 	case map[string]any:
 		for _, key := range []string{"to", "new", "new_value", "value"} {
-			if candidate := displayValue(typed[key]); candidate != "" {
+			candidate := displayValue(typed[key])
+			if candidate != "" {
 				return candidate
 			}
 		}
@@ -1348,37 +1766,40 @@ func historyNewValue(value any) string {
 	return ""
 }
 
-func (s *Server) loadIssueValues(ctx context.Context, projectID int) (map[int]string, map[int]string) {
-	priorities := map[int]string{}
-	severities := map[int]string{}
+func loadIssueNames(ctx context.Context, s *Server, projectID int, endpoint string) map[int]string {
+	names := map[int]string{}
 	if projectID == 0 {
-		return priorities, severities
+		return names
 	}
-	pID := strconv.Itoa(projectID)
-	raw, _, err := s.client.GetJSON(ctx, "/projects/"+pID+"/issue-priorities", url.Values{})
-	if err == nil {
-		if items, ok := raw.([]any); ok {
-			for _, it := range items {
-				if m, ok := it.(map[string]any); ok {
-					if id := displayInt(m["id"]); id > 0 {
-						priorities[id] = strings.TrimSpace(displayValue(m["name"]))
-					}
-				}
-			}
+
+	target := fmt.Sprintf("/projects/%d%s", projectID, endpoint)
+	raw, _, err := s.client.GetJSON(ctx, target, url.Values{})
+	if err != nil {
+		return names
+	}
+
+	items, ok := raw.([]any)
+	if !ok {
+		return names
+	}
+
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := displayInt(m["id"])
+		if id > 0 {
+			names[id] = strings.TrimSpace(displayValue(m["name"]))
 		}
 	}
-	raw, _, err = s.client.GetJSON(ctx, "/projects/"+pID+"/issue-severities", url.Values{})
-	if err == nil {
-		if items, ok := raw.([]any); ok {
-			for _, it := range items {
-				if m, ok := it.(map[string]any); ok {
-					if id := displayInt(m["id"]); id > 0 {
-						severities[id] = strings.TrimSpace(displayValue(m["name"]))
-					}
-				}
-			}
-		}
-	}
+
+	return names
+}
+
+func (s *Server) loadIssueValues(ctx context.Context, projectID int) (map[int]string, map[int]string) {
+	priorities := loadIssueNames(ctx, s, projectID, "/issue-priorities")
+	severities := loadIssueNames(ctx, s, projectID, "/issue-severities")
 	return priorities, severities
 }
 
@@ -1387,28 +1808,38 @@ func extractIntField(data any, key string) int {
 	if !ok {
 		return 0
 	}
-	if f, ok := m[key].(float64); ok {
-		return int(f)
+
+	f, ok := m[key].(float64)
+	if !ok {
+		return 0
 	}
-	return 0
+
+	return int(f)
 }
 
 func (s *Server) loadSubtasks(ctx context.Context, project, object int) []string {
-	if project <= 0 || object <= 0 {
+	if project <= 0 {
 		return nil
 	}
+	if object <= 0 {
+		return nil
+	}
+
 	query := url.Values{
 		"project":    []string{strconv.Itoa(project)},
 		"user_story": []string{strconv.Itoa(object)},
 	}
+
 	raw, _, err := s.client.ListJSON(ctx, "/tasks", query, false)
 	if err != nil {
 		return nil
 	}
+
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
+
 	return formatSubtaskItems(items)
 }
 
@@ -1419,71 +1850,101 @@ func formatSubtaskItems(items []any) []string {
 		if !ok {
 			continue
 		}
-		ref := displayValue(m["ref"])
-		id := displayValue(m["id"])
+
 		subject := redactText(displayValue(m["subject"]))
 		if subject == "" {
 			continue
 		}
-		prefix := ""
-		if ref != "" {
-			prefix = "#" + ref
-		}
-		if id != "" {
-			if prefix != "" {
-				prefix += " · "
-			}
-			prefix += "id " + id
-		}
+
+		prefix := itemPrefix(displayValue(m["id"]), displayValue(m["ref"]))
 		status := translateStatus(resolveName(m, "status"))
 		assigned := redactName(resolveName(m, "assigned_to"))
-		line := "- " + prefix + " — " + subject
+
+		parts := []string{}
+		if prefix != "" {
+			parts = append(parts, prefix)
+		}
+		parts = append(parts, subject)
 		if status != "" {
-			line += " — " + status
+			parts = append(parts, status)
 		}
 		if assigned != "" {
-			line += " — " + assigned
+			parts = append(parts, assigned)
 		}
-		lines = append(lines, line)
+
+		lines = append(lines, fmt.Sprintf("- %s", strings.Join(parts, " — ")))
 	}
 	return lines
 }
 
 func (s *Server) loadAttachmentNames(ctx context.Context, kind string, project, object int) []string {
-	if project == 0 || object == 0 {
+	if project == 0 {
 		return nil
 	}
+	if object == 0 {
+		return nil
+	}
+
 	query := url.Values{
 		"project":   []string{strconv.Itoa(project)},
 		"object_id": []string{strconv.Itoa(object)},
 	}
-	raw, _, err := s.client.ListJSON(ctx, kind+"/attachments", query, false)
+
+	raw, _, err := s.client.ListJSON(ctx, fmt.Sprintf("%s/attachments", kind), query, false)
 	if err != nil {
 		return nil
 	}
+
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
+
 	names := make([]string, 0, len(items))
 	for _, it := range items {
 		m, ok := it.(map[string]any)
 		if !ok {
 			continue
 		}
-		if name := strings.TrimSpace(displayValue(m["name"])); name != "" {
-			id := displayValue(m["id"])
-			desc := strings.TrimSpace(displayValue(m["description"]))
-			prefix := ""
-			if id != "" {
-				prefix = "[" + id + "] "
-			}
-			if desc != "" {
-				names = append(names, prefix+name+" — "+desc)
-			} else {
-				names = append(names, prefix+name)
-			}
+
+		name := strings.TrimSpace(displayValue(m["name"]))
+		if name == "" {
+			continue
+		}
+
+		prefix := ""
+		id := displayValue(m["id"])
+		if id != "" {
+			prefix = fmt.Sprintf("[%s] ", id)
+		}
+
+		desc := strings.TrimSpace(displayValue(m["description"]))
+		if desc != "" {
+			names = append(names, fmt.Sprintf("%s%s — %s", prefix, name, desc))
+		}
+		if desc == "" {
+			names = append(names, fmt.Sprintf("%s%s", prefix, name))
 		}
 	}
+
 	return names
+}
+
+func (s *Server) loadProjectName(ctx context.Context, projectID int) string {
+	if projectID <= 0 {
+		return ""
+	}
+
+	endpoint := fmt.Sprintf("/projects/%d", projectID)
+	proj, _, err := s.client.GetJSON(ctx, endpoint, url.Values{})
+	if err != nil {
+		return ""
+	}
+
+	m, ok := proj.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	return displayValue(m["name"])
 }

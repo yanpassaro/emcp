@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const DEFAULT_TIMEZONE = "America/Sao_Paulo"
+
 type WorkBlock struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
@@ -18,35 +20,44 @@ type Schedule struct {
 	Days     map[string][]WorkBlock `json:"days"`
 }
 
-var weekdayNames = []string{
-	"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-}
-
-func LoadSchedule(raw string) *Schedule {
-	raw = strings.TrimSpace(raw)
-	if raw != "" {
-		var s Schedule
-		if err := json.Unmarshal([]byte(raw), &s); err != nil {
-			return buildDefaultSchedule()
-		}
-		if s.Days == nil {
-			s.Days = map[string][]WorkBlock{}
-		}
-		if s.Timezone == "" {
-			s.Timezone = "America/Sao_Paulo"
-		}
-		return &s
+func weekdayNames() []string {
+	return []string{
+		"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 	}
-	return buildDefaultSchedule()
 }
 
-func buildDefaultSchedule() *Schedule {
-	blocks := []WorkBlock{
+func defaultBlocks() []WorkBlock {
+	return []WorkBlock{
 		{Start: "09:00", End: "09:30", Label: "Daily"},
 		{Start: "09:30", End: "12:00", Label: "Manhã"},
 		{Start: "13:00", End: "18:00", Label: "Tarde"},
 	}
-	s := &Schedule{Timezone: "America/Sao_Paulo", Days: map[string][]WorkBlock{}}
+}
+
+func LoadSchedule(raw string) *Schedule {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return buildDefaultSchedule()
+	}
+
+	s := Schedule{}
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return buildDefaultSchedule()
+	}
+
+	if s.Days == nil {
+		s.Days = map[string][]WorkBlock{}
+	}
+	if s.Timezone == "" {
+		s.Timezone = DEFAULT_TIMEZONE
+	}
+
+	return &s
+}
+
+func buildDefaultSchedule() *Schedule {
+	blocks := defaultBlocks()
+	s := &Schedule{Timezone: DEFAULT_TIMEZONE, Days: map[string][]WorkBlock{}}
 	for _, d := range []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"} {
 		s.Days[d] = blocks
 	}
@@ -57,41 +68,82 @@ func (s *Schedule) BlocksFor(t time.Time) []WorkBlock {
 	if s == nil {
 		return nil
 	}
-	if blocks, ok := s.Days[t.Weekday().String()]; ok {
+
+	blocks, ok := s.Days[t.Weekday().String()]
+	if ok {
 		return blocks
 	}
-	if blocks, ok := s.Days["Default"]; ok {
+
+	blocks, ok = s.Days["Default"]
+	if ok {
 		return blocks
 	}
+
 	return nil
 }
 
 func (s *Schedule) location() *time.Location {
-	if s == nil || s.Timezone == "" {
+	if s == nil {
 		return time.Local
 	}
-	if loc, err := time.LoadLocation(s.Timezone); err == nil {
-		return loc
+
+	if s.Timezone == "" {
+		return time.Local
 	}
-	return time.Local
+
+	loc, err := time.LoadLocation(s.Timezone)
+	if err != nil {
+		return time.Local
+	}
+
+	return loc
+}
+
+func validHour(h int) bool {
+	if h < 0 {
+		return false
+	}
+	return h <= 23
+}
+
+func validMinute(m int) bool {
+	if m < 0 {
+		return false
+	}
+	return m <= 59
 }
 
 func blockTime(day time.Time, hhmm string) (time.Time, bool) {
-	var h, m int
+	h := 0
+	m := 0
 	if _, err := fmt.Sscanf(hhmm, "%d:%d", &h, &m); err != nil {
 		return time.Time{}, false
 	}
-	if h < 0 || h > 23 || m < 0 || m > 59 {
+
+	if !validHour(h) {
 		return time.Time{}, false
 	}
+
+	if !validMinute(m) {
+		return time.Time{}, false
+	}
+
 	return time.Date(day.Year(), day.Month(), day.Day(), h, m, 0, 0, day.Location()), true
+}
+
+func dayLabel(key string) string {
+	if key == "Default" {
+		return "Todos os dias"
+	}
+	return key
 }
 
 func formatScheduleSection(s *Schedule) string {
 	if s == nil {
-		return "🗓️ **Horário fixo:** nenhum configurado (defina KIMAI_SCHEDULE)."
+		return SCHEDULE_MISSING
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("🗓️ **Horário fixo**")
 	if s.Timezone != "" {
 		fmt.Fprintf(&b, " (%s)", s.Timezone)
@@ -99,26 +151,24 @@ func formatScheduleSection(s *Schedule) string {
 	b.WriteString(":\n")
 
 	order := []string{"Default"}
-	order = append(order, weekdayNames...)
+	order = append(order, weekdayNames()...)
+
 	shown := map[string]bool{}
 	for _, key := range order {
 		blocks, ok := s.Days[key]
-		if !ok || shown[key] {
+		if !ok {
+			continue
+		}
+		if shown[key] {
 			continue
 		}
 		shown[key] = true
-		label := key
-		if key == "Default" {
-			label = "Todos os dias"
-		}
-		fmt.Fprintf(&b, "- **%s:**\n", label)
+
+		fmt.Fprintf(&b, "- **%s:**\n", dayLabel(key))
 		for _, blk := range blocks {
-			name := blk.Label
-			if name == "" {
-				name = "—"
-			}
-			fmt.Fprintf(&b, "  - %s–%s %s\n", blk.Start, blk.End, name)
+			fmt.Fprintf(&b, "  - %s–%s %s\n", blk.Start, blk.End, blockLabel(blk))
 		}
 	}
+
 	return strings.TrimSpace(b.String())
 }

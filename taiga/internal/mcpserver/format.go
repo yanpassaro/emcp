@@ -10,41 +10,69 @@ import (
 	"ntdsk.com/taiga/internal/taiga"
 )
 
+const (
+	SIM           = "sim"
+	NAO           = "não"
+	DASH          = "—"
+	KILOBYTE      = 1024
+	MEGABYTE      = 1024 * 1024
+	DATE_ONLY_LEN = 10
+	MAX_LINKS     = 50
+	DATE_FORMAT   = "02/01/2006 às 15:04"
+)
+
+func yesNoFlag(v any) string {
+	if displayBool(v) {
+		return "**sim**"
+	}
+	return NAO
+}
+
+func shortDate(obj map[string]any, key string) string {
+	value := displayValue(obj[key])
+	if len(value) > DATE_ONLY_LEN {
+		return value[:DATE_ONLY_LEN]
+	}
+	return value
+}
+
+func appendPagination(b *strings.Builder, meta taiga.ResponseMeta) {
+	text := formatPagination(meta)
+	if text == "" {
+		return
+	}
+	b.WriteString("\n")
+	b.WriteString(text)
+	b.WriteString("\n")
+}
+
 func formatProjectsTable(data any, meta taiga.ResponseMeta) string {
 	items, ok := data.([]any)
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("| ID | Nome | Slug | Criado em | Atividade (total) | Você é admin? |\n")
 	b.WriteString("|----|------|------|-----------|-------------------|---------------|\n")
+
 	for _, item := range items {
 		proj, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		created := displayValue(proj["created_date"])
-		if len(created) > 10 {
-			created = created[:10]
-		}
-		admin := "não"
-		if displayBool(proj["i_am_admin"]) {
-			admin = "**sim**"
-		}
+
 		fmt.Fprintf(&b, "| %s | %s | `%s` | %s | %s | %s |\n",
 			displayValue(proj["id"]),
 			displayValue(proj["name"]),
 			stringOrEmpty(proj["slug"]),
-			created,
+			shortDate(proj, "created_date"),
 			formatInt(displayInt(proj["total_activity"])),
-			admin,
+			yesNoFlag(proj["i_am_admin"]),
 		)
 	}
-	if text := formatPagination(meta); text != "" {
-		b.WriteString("\n")
-		b.WriteString(text)
-		b.WriteString("\n")
-	}
+
+	appendPagination(&b, meta)
 	return b.String()
 }
 
@@ -53,59 +81,51 @@ func formatCardsTable(data any, meta taiga.ResponseMeta) string {
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("| ID | Ref | Assunto | Status | Responsável | Fechado? | Bloqueado? | Modificado em |\n")
 	b.WriteString("|----|-----|---------|--------|-------------|----------|-----------|--------------|\n")
+
 	for _, item := range items {
 		card, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		modified := displayValue(card["modified_date"])
-		if len(modified) > 10 {
-			modified = modified[:10]
-		}
-		closed := "não"
-		if displayBool(card["is_closed"]) {
-			closed = "**sim**"
-		}
-		blocked := "não"
-		if displayBool(card["is_blocked"]) {
-			blocked = "**sim**"
-		}
+
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
 			displayValue(card["id"]),
 			displayValue(card["ref"]),
 			redactText(displayValue(card["subject"])),
 			translateStatus(resolveName(card, "status")),
 			redactName(resolveName(card, "assigned_to")),
-			closed,
-			blocked,
-			modified,
+			yesNoFlag(card["is_closed"]),
+			yesNoFlag(card["is_blocked"]),
+			shortDate(card, "modified_date"),
 		)
 	}
-	if text := formatPagination(meta); text != "" {
-		b.WriteString("\n")
-		b.WriteString(text)
-		b.WriteString("\n")
-	}
+
+	appendPagination(&b, meta)
 	return b.String()
 }
 
 func formatCount(label string, count, projectID int, projectName string, filters []string) string {
-	var b strings.Builder
+	b := strings.Builder{}
 	fmt.Fprintf(&b, "📊 **Total de %s: %s**\n\n", label, formatInt(count))
+
 	if projectName != "" {
 		fmt.Fprintf(&b, "- **Projeto:** %s (id %d)\n", projectName, projectID)
-	} else {
+	}
+	if projectName == "" {
 		fmt.Fprintf(&b, "- **Projeto:** id %d\n", projectID)
 	}
+
 	if len(filters) > 0 {
 		b.WriteString("\nFiltros aplicados:\n")
 		for _, f := range filters {
 			fmt.Fprintf(&b, "- %s\n", f)
 		}
 	}
+
 	return strings.TrimSpace(b.String())
 }
 
@@ -114,22 +134,17 @@ func formatIssuesTable(data any, meta taiga.ResponseMeta, priorities, severities
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("| ID | Ref | Assunto | Status | Prioridade | Severidade | Fechado? | Modificado em |\n")
 	b.WriteString("|----|-----|---------|--------|------------|------------|----------|--------------|\n")
+
 	for _, item := range items {
 		issue, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		modified := displayValue(issue["modified_date"])
-		if len(modified) > 10 {
-			modified = modified[:10]
-		}
-		closed := "não"
-		if displayBool(issue["is_closed"]) {
-			closed = "**sim**"
-		}
+
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
 			displayValue(issue["id"]),
 			displayValue(issue["ref"]),
@@ -137,15 +152,12 @@ func formatIssuesTable(data any, meta taiga.ResponseMeta, priorities, severities
 			translateStatus(resolveName(issue, "status")),
 			resolveFieldValue(issue, "priority", priorities),
 			resolveFieldValue(issue, "severity", severities),
-			closed,
-			modified,
+			yesNoFlag(issue["is_closed"]),
+			shortDate(issue, "modified_date"),
 		)
 	}
-	if text := formatPagination(meta); text != "" {
-		b.WriteString("\n")
-		b.WriteString(text)
-		b.WriteString("\n")
-	}
+
+	appendPagination(&b, meta)
 	return b.String()
 }
 
@@ -154,22 +166,17 @@ func formatTasksTable(data any, meta taiga.ResponseMeta) string {
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("| ID | Ref | Assunto | Status | Responsável | Card vinculado | Fechado? | Modificado em |\n")
 	b.WriteString("|----|-----|---------|--------|-------------|----------------|----------|--------------|\n")
+
 	for _, item := range items {
 		task, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		modified := displayValue(task["modified_date"])
-		if len(modified) > 10 {
-			modified = modified[:10]
-		}
-		closed := "não"
-		if displayBool(task["is_closed"]) {
-			closed = "**sim**"
-		}
+
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
 			displayValue(task["id"]),
 			displayValue(task["ref"]),
@@ -177,15 +184,12 @@ func formatTasksTable(data any, meta taiga.ResponseMeta) string {
 			translateStatus(resolveName(task, "status")),
 			redactName(resolveName(task, "assigned_to")),
 			linkedStory(task),
-			closed,
-			modified,
+			yesNoFlag(task["is_closed"]),
+			shortDate(task, "modified_date"),
 		)
 	}
-	if text := formatPagination(meta); text != "" {
-		b.WriteString("\n")
-		b.WriteString(text)
-		b.WriteString("\n")
-	}
+
+	appendPagination(&b, meta)
 	return b.String()
 }
 
@@ -194,36 +198,45 @@ func formatAttachmentsTable(data any) string {
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	b.WriteString("| ID | Nome | Tipo | Tamanho |\n")
 	b.WriteString("|----|------|------|---------|\n")
+
 	for _, item := range items {
 		att, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		name := displayValue(att["name"])
 		mime := firstString(att, "content_type", "mime_type", "mimetype", "type")
 		if mime == "" {
 			mime = fileTypeFromName(name)
 		}
+
 		size := int64(displayInt(att["size"]))
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
-			displayValue(att["id"]),
-			name,
-			mime,
-			formatFileSize(size),
+			displayValue(att["id"]), name, mime, formatFileSize(size),
 		)
 	}
+
 	return b.String()
 }
 
-func fileTypeFromName(name string) string {
-	ext := ""
-	if i := strings.LastIndex(name, "."); i >= 0 && i < len(name)-1 {
-		ext = strings.ToLower(name[i+1:])
+func fileExt(name string) string {
+	i := strings.LastIndex(name, ".")
+	if i < 0 {
+		return ""
 	}
-	switch ext {
+	if i >= len(name)-1 {
+		return ""
+	}
+	return strings.ToLower(name[i+1:])
+}
+
+func fileTypeFromName(name string) string {
+	switch fileExt(name) {
 	case "png":
 		return "image/png"
 	case "jpg", "jpeg":
@@ -247,37 +260,45 @@ func fileTypeFromName(name string) string {
 	case "zip", "rar", "7z", "tar", "gz":
 		return "application/zip"
 	case "":
-		return "—"
+		return DASH
 	default:
-		return strings.ToUpper(ext)
+		return strings.ToUpper(fileExt(name))
 	}
+}
+
+func activityKind(it activityItem) string {
+	if it.kind == "issue" {
+		return "Issue"
+	}
+	return "Card"
 }
 
 func formatActivityTable(items []activityItem) string {
 	if len(items) == 0 {
 		return "Nenhuma atividade encontrada."
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	for _, it := range items {
-		kind := "Card"
-		if it.kind == "issue" {
-			kind = "Issue"
-		}
 		action := it.action
 		if action == "" {
 			action = "📝 Atividade registrada"
 		}
+
 		modified := formatActivityDate(it.modified)
-		fmt.Fprintf(&b, "### %s #%s — %s\n\n", kind, displayValue(it.ref), redactText(it.subject))
+		fmt.Fprintf(&b, "### %s #%s — %s\n\n", activityKind(it), displayValue(it.ref), redactText(it.subject))
 		fmt.Fprintf(&b, "- **O que aconteceu:** %s\n", action)
+
 		if it.assigned != "" {
 			fmt.Fprintf(&b, "- **Responsável:** %s\n", it.assigned)
 		}
 		if modified != "" {
 			fmt.Fprintf(&b, "- **Quando:** %s\n", modified)
 		}
+
 		b.WriteString("\n")
 	}
+
 	return strings.TrimSpace(b.String())
 }
 
@@ -287,23 +308,29 @@ type historyEntryView struct {
 	action string
 }
 
-func formatHistoryTable(kind string, ref int, subject, status string, entries []historyEntryView) string {
-	kindLabel := "Card"
+func historyKindLabel(kind string) string {
 	switch kind {
 	case "issue":
-		kindLabel = "Issue"
+		return "Issue"
 	case "task":
-		kindLabel = "Task"
+		return "Task"
+	default:
+		return "Card"
 	}
-	var b strings.Builder
-	title := fmt.Sprintf("%s #%s — %s", kindLabel, displayValue(ref), redactText(subject))
-	fmt.Fprintf(&b, "### %s\n\n", title)
+}
+
+func formatHistoryTable(kind string, ref int, subject, status string, entries []historyEntryView) string {
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "### %s #%s — %s\n\n", historyKindLabel(kind), displayValue(ref), redactText(subject))
+
 	if status != "" {
 		fmt.Fprintf(&b, "- **Status:** %s\n", status)
 	}
+
 	b.WriteString("\n")
 	b.WriteString("| Data | Autor | Atividade |\n")
 	b.WriteString("|------|-------|-----------|\n")
+
 	for _, e := range entries {
 		date := formatActivityDate(e.date)
 		action := strings.TrimSpace(e.action)
@@ -312,6 +339,7 @@ func formatHistoryTable(kind string, ref int, subject, status string, entries []
 		}
 		fmt.Fprintf(&b, "| %s | %s | %s |\n", date, e.author, action)
 	}
+
 	return strings.TrimSpace(b.String())
 }
 
@@ -320,7 +348,65 @@ func formatActivityDate(value string) string {
 	if parsed.IsZero() {
 		return value
 	}
-	return parsed.Format("02/01/2006 às 15:04")
+	return parsed.Format(DATE_FORMAT)
+}
+
+func projectMetaLines(obj map[string]any) []string {
+	meta := []string{}
+	addMeta := func(label, key string) {
+		if v := displayValue(obj[key]); v != "" {
+			meta = append(meta, fmt.Sprintf("**%s:** %s", label, v))
+		}
+	}
+
+	addMeta("Criado em", "created_date")
+	addMeta("Modificado em", "modified_date")
+	return meta
+}
+
+func projectFeatures(obj map[string]any) []string {
+	features := []string{}
+	if displayBool(obj["is_private"]) {
+		features = append(features, "**Privado:** sim")
+	}
+
+	m := displayInt(obj["total_memberships"])
+	if m > 0 {
+		features = append(features, fmt.Sprintf("**Membros:** %s", formatInt(m)))
+	}
+
+	w := displayInt(obj["total_watchers"])
+	if w > 0 {
+		features = append(features, fmt.Sprintf("**Watchers:** %s", formatInt(w)))
+	}
+
+	pairs := [][2]string{
+		{"is_kanban_activated", "Kanban"}, {"is_wiki_activated", "Wiki"},
+		{"is_issues_activated", "Issues"}, {"is_contact_activated", "Contato"},
+	}
+
+	for _, pair := range pairs {
+		if displayBool(obj[pair[0]]) {
+			features = append(features, fmt.Sprintf("**%s:** sim", pair[1]))
+		}
+	}
+
+	return features
+}
+
+func projectActivityLine(obj map[string]any) string {
+	total := displayInt(obj["total_activity"])
+	if total <= 0 {
+		return ""
+	}
+
+	line := fmt.Sprintf("**Atividade total:** %s", formatInt(total))
+	month := displayInt(obj["total_activity_last_month"])
+	if month > 0 {
+		line = fmt.Sprintf("%s (último mês: %s)", line, formatInt(month))
+	}
+
+	return line
 }
 
 func formatProject(data any, activities []activityItem) string {
@@ -328,113 +414,123 @@ func formatProject(data any, activities []activityItem) string {
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	fmt.Fprintf(&b, "# %s\n\n", redactText(displayValue(obj["name"])))
-	if desc := redactText(displayValue(obj["description"])); desc != "" {
+
+	desc := redactText(displayValue(obj["description"]))
+	if desc != "" {
 		fmt.Fprintf(&b, "**Descrição:** %s\n\n", desc)
 	}
-	if slug := stringOrEmpty(obj["slug"]); slug != "" {
+
+	slug := stringOrEmpty(obj["slug"])
+	if slug != "" {
 		fmt.Fprintf(&b, "**Slug:** `%s`\n\n", slug)
 	}
-	meta := []string{}
-	addMeta := func(label, key string) {
-		if v := displayValue(obj[key]); v != "" {
-			meta = append(meta, fmt.Sprintf("**%s:** %s", label, v))
-		}
-	}
-	addMeta("Criado em", "created_date")
-	addMeta("Modificado em", "modified_date")
+
+	meta := projectMetaLines(obj)
 	if len(meta) > 0 {
 		b.WriteString(strings.Join(meta, " | "))
 		b.WriteString("\n\n")
 	}
-	features := []string{}
-	if displayBool(obj["is_private"]) {
-		features = append(features, "**Privado:** sim")
-	}
-	if m := displayInt(obj["total_memberships"]); m > 0 {
-		features = append(features, fmt.Sprintf("**Membros:** %s", formatInt(m)))
-	}
-	if w := displayInt(obj["total_watchers"]); w > 0 {
-		features = append(features, fmt.Sprintf("**Watchers:** %s", formatInt(w)))
-	}
-	for _, pair := range [][2]string{
-		{"is_kanban_activated", "Kanban"}, {"is_wiki_activated", "Wiki"},
-		{"is_issues_activated", "Issues"}, {"is_contact_activated", "Contato"},
-	} {
-		if displayBool(obj[pair[0]]) {
-			features = append(features, "**"+pair[1]+":** sim")
-		}
-	}
+
+	features := projectFeatures(obj)
 	if len(features) > 0 {
 		b.WriteString(strings.Join(features, " | "))
 		b.WriteString("\n\n")
 	}
-	if statuses := formatProjectOptions("Status", obj["us_statuses"]); statuses != "" {
+
+	statuses := formatProjectOptions("Status", obj["us_statuses"])
+	if statuses != "" {
 		b.WriteString(statuses)
 	}
-	if swimlanes := formatProjectOptions("Baias", obj["swimlanes"]); swimlanes != "" {
+
+	swimlanes := formatProjectOptions("Baias", obj["swimlanes"])
+	if swimlanes != "" {
 		b.WriteString(swimlanes)
 	}
-	if tags := formatProjectTags(obj["tags_colors"]); tags != "" {
+
+	tags := formatProjectTags(obj["tags_colors"])
+	if tags != "" {
 		b.WriteString(tags)
 	}
-	if total := displayInt(obj["total_activity"]); total > 0 {
-		line := fmt.Sprintf("**Atividade total:** %s", formatInt(total))
-		if month := displayInt(obj["total_activity_last_month"]); month > 0 {
-			line += fmt.Sprintf(" (último mês: %s)", formatInt(month))
-		}
+
+	line := projectActivityLine(obj)
+	if line != "" {
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
+
 	if len(activities) > 0 {
 		b.WriteString("\n### Últimas atividades\n\n")
 		b.WriteString(formatActivityTable(activities))
 	}
+
 	return b.String()
 }
 
 func formatProjectOptions(title string, value any) string {
 	items, ok := value.([]any)
-	if !ok || len(items) == 0 {
+	if !ok {
 		return ""
 	}
+
+	if len(items) == 0 {
+		return ""
+	}
+
 	lines := make([]string, 0, len(items))
 	for _, item := range items {
 		option, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		id := displayValue(option["id"])
 		name := redactText(displayValue(option["name"]))
-		if id == "" || name == "" {
+		if id == "" {
 			continue
 		}
+		if name == "" {
+			continue
+		}
+
 		lines = append(lines, fmt.Sprintf("- `%s`: %s", id, name))
 	}
+
 	if len(lines) == 0 {
 		return ""
 	}
-	var b strings.Builder
+
+	b := strings.Builder{}
 	fmt.Fprintf(&b, "**%s:**\n", title)
 	b.WriteString(strings.Join(lines, "\n"))
 	b.WriteString("\n\n")
 	return b.String()
 }
 
-func formatProjectTags(value any) string {
-	colors, ok := value.(map[string]any)
-	if !ok || len(colors) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(colors))
-	for t := range colors {
-		keys = append(keys, t)
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	var b strings.Builder
+	return keys
+}
+
+func formatProjectTags(value any) string {
+	colors, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	if len(colors) == 0 {
+		return ""
+	}
+
+	b := strings.Builder{}
 	b.WriteString("🏷️ **Tags do projeto** (ortografia exata para uso nas tags):\n")
-	for _, t := range keys {
+	for _, t := range sortedKeys(colors) {
 		fmt.Fprintf(&b, "- `%s`\n", redactText(t))
 	}
 	b.WriteString("\n")
@@ -446,13 +542,9 @@ func formatObject(data any) string {
 	if !ok {
 		return singleValue(data)
 	}
-	keys := make([]string, 0, len(obj))
-	for k := range obj {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
+
+	b := strings.Builder{}
+	for _, k := range sortedKeys(obj) {
 		fmt.Fprintf(&b, "- **%s**: %s\n", k, redactText(displayValue(obj[k])))
 	}
 	return b.String()
@@ -464,90 +556,158 @@ type commentView struct {
 	text   string
 }
 
-func formatDetailedItem(data any, comments []commentView, attachments []string, subtasks []string, priorities, severities map[int]string) string {
-	obj, ok := data.(map[string]any)
-	if !ok {
-		return singleValue(data)
-	}
-	var b strings.Builder
-	subject := redactText(displayValue(obj["subject"]))
-	b.WriteString("# ")
-	b.WriteString(subject)
-	b.WriteString("\n\n")
+func detailedBadges(obj map[string]any, priorities, severities map[int]string) []string {
+	badges := []string{fmt.Sprintf("**Status:** %s", translateStatus(resolveName(obj, "status")))}
 
-	id := displayValue(obj["id"])
-	ref := displayValue(obj["ref"])
-	if id != "" || ref != "" {
-		if id != "" {
-			fmt.Fprintf(&b, "#%s", id)
-		}
-		if ref != "" {
-			if id != "" {
-				b.WriteString("  ·  ")
-			}
-			fmt.Fprintf(&b, "ref %s", ref)
-		}
-		b.WriteString("\n\n")
+	assigned := redactName(resolveName(obj, "assigned_to"))
+	if assigned != "" {
+		badges = append(badges, fmt.Sprintf("**Responsável:** %s", assigned))
 	}
 
-	badges := []string{"**Status:** " + translateStatus(resolveName(obj, "status"))}
-	if assigned := redactName(resolveName(obj, "assigned_to")); assigned != "" {
-		badges = append(badges, "**Responsável:** "+assigned)
+	project := resolveName(obj, "project")
+	if project != "" {
+		badges = append(badges, fmt.Sprintf("**Projeto:** %s", project))
 	}
-	if project := resolveName(obj, "project"); project != "" {
-		badges = append(badges, "**Projeto:** "+project)
-	}
-	if priority := resolveFieldValue(obj, "priority", priorities); priority != "" {
-		badges = append(badges, "**Prioridade:** "+priority)
-	}
-	if severity := resolveFieldValue(obj, "severity", severities); severity != "" {
-		badges = append(badges, "**Severidade:** "+severity)
-	}
-	b.WriteString(strings.Join(badges, "  |  "))
-	b.WriteString("\n\n")
 
+	priority := resolveFieldValue(obj, "priority", priorities)
+	if priority != "" {
+		badges = append(badges, fmt.Sprintf("**Prioridade:** %s", priority))
+	}
+
+	severity := resolveFieldValue(obj, "severity", severities)
+	if severity != "" {
+		badges = append(badges, fmt.Sprintf("**Severidade:** %s", severity))
+	}
+
+	return badges
+}
+
+func detailedMeta(obj map[string]any) []string {
 	meta := []string{}
 	addMeta := func(label, key string) {
 		if v := displayValue(obj[key]); v != "" {
 			meta = append(meta, fmt.Sprintf("- **%s:** %s", label, v))
 		}
 	}
+
 	addMeta("Criado em", "created_date")
 	addMeta("Modificado em", "modified_date")
 	addMeta("Fechado?", "is_closed")
-	if tags := inlineList(obj["tags"]); tags != "" {
-		meta = append(meta, "- **Tags:** "+tags)
+
+	tags := inlineList(obj["tags"])
+	if tags != "" {
+		meta = append(meta, fmt.Sprintf("- **Tags:** %s", tags))
 	}
+
+	return meta
+}
+
+func detailedCounts(obj map[string]any) []string {
+	counts := []string{}
+
+	a := displayInt(obj["total_attachments"])
+	if a > 0 {
+		counts = append(counts, fmt.Sprintf("📎 %s anexos", formatInt(a)))
+	}
+
+	c := displayInt(obj["total_comments"])
+	if c > 0 {
+		counts = append(counts, fmt.Sprintf("💬 %s comentários", formatInt(c)))
+	}
+
+	w := displayInt(obj["total_watchers"])
+	if w > 0 {
+		counts = append(counts, fmt.Sprintf("👁 %s observadores", formatInt(w)))
+	}
+
+	return counts
+}
+
+func writeAttachments(b *strings.Builder, attachments []string) {
+	if len(attachments) == 0 {
+		return
+	}
+
+	b.WriteString("\n### Anexos\n\n")
+
+	listed := attachments
+	if len(listed) > MAX_LINKS {
+		listed = listed[len(listed)-MAX_LINKS:]
+	}
+
+	b.WriteString("\n")
+	for _, name := range listed {
+		fmt.Fprintf(b, "%s\n", name)
+	}
+}
+
+func commentHeader(c commentView) string {
+	who := redactName(c.author)
+	if who == "" {
+		who = DASH
+	}
+
+	when := ""
+	if c.date != "" {
+		when = fmt.Sprintf(" · %s", c.date)
+	}
+
+	return fmt.Sprintf("%s%s", who, when)
+}
+
+func writeComments(b *strings.Builder, comments []commentView) {
+	if len(comments) == 0 {
+		return
+	}
+
+	fmt.Fprintf(b, "\n### Comentários (%d)\n\n", len(comments))
+	for _, c := range comments {
+		fmt.Fprintf(b, "**%s**\n\n%s\n\n", commentHeader(c), redactText(stripHTML(c.text)))
+	}
+}
+
+func formatDetailedItem(data any, comments []commentView, attachments []string, subtasks []string, priorities, severities map[int]string) string {
+	obj, ok := data.(map[string]any)
+	if !ok {
+		return singleValue(data)
+	}
+
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "# %s\n\n", redactText(displayValue(obj["subject"])))
+
+	id := displayValue(obj["id"])
+	ref := displayValue(obj["ref"])
+	writeRefLine(&b, id, ref)
+
+	b.WriteString(strings.Join(detailedBadges(obj, priorities, severities), "  |  "))
+	b.WriteString("\n\n")
+
+	meta := detailedMeta(obj)
 	if len(meta) > 0 {
 		b.WriteString(strings.Join(meta, "\n"))
 		b.WriteString("\n\n")
 	}
 
-	if desc := strings.TrimSpace(redactText(displayValue(obj["description"]))); desc != "" {
+	desc := strings.TrimSpace(redactText(displayValue(obj["description"])))
+	if desc != "" {
 		b.WriteString("### Descrição\n\n")
 		b.WriteString(desc)
 		b.WriteString("\n\n")
 	}
 
-	counts := []string{}
-	if a := displayInt(obj["total_attachments"]); a > 0 {
-		counts = append(counts, fmt.Sprintf("📎 %s anexos", formatInt(a)))
-	}
-	if c := displayInt(obj["total_comments"]); c > 0 {
-		counts = append(counts, fmt.Sprintf("💬 %s comentários", formatInt(c)))
-	}
-	if w := displayInt(obj["total_watchers"]); w > 0 {
-		counts = append(counts, fmt.Sprintf("👁 %s observadores", formatInt(w)))
-	}
+	counts := detailedCounts(obj)
 	if len(counts) > 0 {
 		b.WriteString(strings.Join(counts, "  "))
 		b.WriteString("\n")
 	}
-	if linked := formatLinkedCards(obj); linked != "" {
+
+	linked := formatLinkedCards(obj)
+	if linked != "" {
 		b.WriteString("\n### Cards vinculados\n\n")
 		b.WriteString(linked)
 		b.WriteString("\n")
 	}
+
 	subtaskText := strings.Join(subtasks, "\n")
 	if subtaskText == "" {
 		subtaskText = formatSubtasks(obj)
@@ -557,32 +717,26 @@ func formatDetailedItem(data any, comments []commentView, attachments []string, 
 		b.WriteString(subtaskText)
 		b.WriteString("\n")
 	}
-	if len(attachments) > 0 {
-		b.WriteString("\n### Anexos\n\n")
-		listed := attachments
-		if len(listed) > 50 {
-			listed = listed[len(listed)-50:]
-		}
-		b.WriteString("\n")
-		for _, name := range listed {
-			fmt.Fprintf(&b, "%s\n", name)
-		}
-	}
-	if len(comments) > 0 {
-		fmt.Fprintf(&b, "\n### Comentários (%d)\n\n", len(comments))
-		for _, c := range comments {
-			who := redactName(c.author)
-			if who == "" {
-				who = "—"
-			}
-			when := ""
-			if c.date != "" {
-				when = " · " + c.date
-			}
-			fmt.Fprintf(&b, "**%s**%s\n\n%s\n\n", who, when, redactText(stripHTML(c.text)))
-		}
-	}
+
+	writeAttachments(&b, attachments)
+	writeComments(&b, comments)
 	return b.String()
+}
+
+func writeRefLine(b *strings.Builder, id, ref string) {
+	if id == "" {
+		if ref == "" {
+			return
+		}
+		fmt.Fprintf(b, "ref %s\n\n", ref)
+		return
+	}
+
+	fmt.Fprintf(b, "#%s", id)
+	if ref != "" {
+		fmt.Fprintf(b, "  ·  ref %s", ref)
+	}
+	b.WriteString("\n\n")
 }
 
 func formatTaskItem(data any, comments []commentView, attachments []string) string {
@@ -590,31 +744,67 @@ func formatTaskItem(data any, comments []commentView, attachments []string) stri
 	if !ok {
 		return singleValue(data)
 	}
-	var b strings.Builder
-	if parent := linkedStory(obj); parent != "—" {
+
+	b := strings.Builder{}
+	parent := linkedStory(obj)
+	if parent != DASH {
 		b.WriteString("### Card vinculado\n\n")
 		fmt.Fprintf(&b, "- %s\n\n", parent)
 	}
+
 	b.WriteString(formatDetailedItem(data, comments, attachments, nil, nil, nil))
 	return b.String()
 }
 
 func linkedStory(obj map[string]any) string {
 	extra, ok := obj["user_story_extra_info"].(map[string]any)
-	if !ok || len(extra) == 0 {
-		return "—"
+	if !ok {
+		return DASH
 	}
+
+	if len(extra) == 0 {
+		return DASH
+	}
+
 	ref := displayValue(extra["ref"])
 	subject := redactText(displayValue(extra["subject"]))
+
 	switch {
-	case ref != "" && subject != "":
-		return ref + " — " + subject
 	case ref != "":
+		if subject != "" {
+			return fmt.Sprintf("%s — %s", ref, subject)
+		}
 		return ref
 	case subject != "":
 		return subject
+	default:
+		return DASH
 	}
-	return "—"
+}
+
+func itemSubject(m map[string]any) string {
+	subject := redactText(displayValue(m["subject"]))
+	if subject != "" {
+		return subject
+	}
+	return redactText(displayValue(m["name"]))
+}
+
+func itemPrefix(id, ref string) string {
+	prefix := ""
+	if ref != "" {
+		prefix = fmt.Sprintf("ref %s", ref)
+	}
+
+	if id == "" {
+		return prefix
+	}
+
+	if prefix == "" {
+		return fmt.Sprintf("id %s", id)
+	}
+
+	return fmt.Sprintf("%s · id %s", prefix, id)
 }
 
 func formatSubtasks(obj map[string]any) string {
@@ -622,101 +812,102 @@ func formatSubtasks(obj map[string]any) string {
 	if !ok {
 		return ""
 	}
+
 	items, ok := value.([]any)
-	if !ok || len(items) == 0 {
+	if !ok {
 		return ""
 	}
+
+	if len(items) == 0 {
+		return ""
+	}
+
 	lines := make([]string, 0, len(items))
 	for _, item := range items {
 		task, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		id := displayValue(task["id"])
-		ref := displayValue(task["ref"])
-		subject := redactText(displayValue(task["subject"]))
-		if subject == "" {
-			subject = redactText(displayValue(task["name"]))
-		}
+
+		subject := itemSubject(task)
 		if subject == "" {
 			continue
 		}
-		prefix := ""
-		if ref != "" {
-			prefix = "ref " + ref
-		}
-		if id != "" {
-			if prefix != "" {
-				prefix += " · "
-			}
-			prefix += "id " + id
-		}
+
+		prefix := itemPrefix(displayValue(task["id"]), displayValue(task["ref"]))
 		status := translateStatus(resolveName(task, "status"))
 		assigned := redactName(resolveName(task, "assigned_to"))
-		line := "- "
+
+		parts := []string{}
 		if prefix != "" {
-			line += prefix + " — "
+			parts = append(parts, prefix)
 		}
-		line += subject
+		parts = append(parts, subject)
 		if status != "" {
-			line += " — " + status
+			parts = append(parts, status)
 		}
 		if assigned != "" {
-			line += " — " + assigned
+			parts = append(parts, assigned)
 		}
-		lines = append(lines, line)
+
+		lines = append(lines, fmt.Sprintf("- %s", strings.Join(parts, " — ")))
 	}
+
 	return strings.Join(lines, "\n")
+}
+
+func linkedLines(items []any) []string {
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		subject := itemSubject(m)
+		if subject == "" {
+			continue
+		}
+
+		prefix := itemPrefix(displayValue(m["id"]), displayValue(m["ref"]))
+		if prefix == "" {
+			lines = append(lines, fmt.Sprintf("- %s", subject))
+			continue
+		}
+
+		lines = append(lines, fmt.Sprintf("- %s — %s", prefix, subject))
+	}
+
+	return lines
 }
 
 func formatLinkedCards(obj map[string]any) string {
 	for _, key := range []string{"subcards", "sub_cards", "children", "related_userstories", "related_cards"} {
 		items, ok := obj[key].([]any)
-		if !ok || len(items) == 0 {
+		if !ok {
 			continue
 		}
-		lines := make([]string, 0, len(items))
-		for _, item := range items {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			id := displayValue(m["id"])
-			ref := displayValue(m["ref"])
-			subject := redactText(displayValue(m["subject"]))
-			if subject == "" {
-				subject = redactText(displayValue(m["name"]))
-			}
-			if subject == "" {
-				continue
-			}
-			prefix := ""
-			if ref != "" {
-				prefix = "ref " + ref
-			}
-			if id != "" {
-				if prefix != "" {
-					prefix += " · "
-				}
-				prefix += "id " + id
-			}
-			if prefix != "" {
-				prefix += " — "
-			}
-			lines = append(lines, "- "+prefix+subject)
+		if len(items) == 0 {
+			continue
 		}
-		if len(lines) > 0 {
-			return strings.Join(lines, "\n")
+
+		lines := linkedLines(items)
+		if len(lines) == 0 {
+			continue
 		}
+
+		return strings.Join(lines, "\n")
 	}
+
 	return ""
 }
 
 func resolveName(obj map[string]any, base string) string {
-	extra, ok := obj[base+"_extra_info"]
+	extra, ok := obj[fmt.Sprintf("%s_extra_info", base)]
 	if !ok {
 		return displayValue(obj[base])
 	}
+
 	switch typed := extra.(type) {
 	case string:
 		if strings.TrimSpace(typed) != "" {
@@ -724,11 +915,13 @@ func resolveName(obj map[string]any, base string) string {
 		}
 	case map[string]any:
 		for _, key := range []string{"full_name_display", "username", "name", "subject"} {
-			if v, ok := typed[key].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
+			v := stringOrEmpty(typed[key])
+			if v != "" {
+				return v
 			}
 		}
 	}
+
 	return displayValue(obj[base])
 }
 
@@ -739,26 +932,25 @@ func translateStatus(status string) string {
 		"in progress":    "Em andamento",
 		"ready":          "Pronto",
 		"test":           "Em teste",
-
-		"closed":   "Fechado",
-		"done":     "Concluído",
-		"archived": "Arquivado",
-		"rejected": "Rejeitado",
-		"blocked":  "Bloqueado",
+		"closed":         "Fechado",
+		"done":           "Concluído",
+		"archived":       "Arquivado",
+		"rejected":       "Rejeitado",
+		"blocked":        "Bloqueado",
 	}
-	if translated, ok := translations[strings.ToLower(strings.TrimSpace(status))]; ok {
+
+	translated, ok := translations[strings.ToLower(strings.TrimSpace(status))]
+	if ok {
 		return translated
 	}
+
 	return status
 }
 
 func stripHTML(s string) string {
-	re := regexp.MustCompile(`(?i)<br\s*/?>|</p>|</li>`)
-	s = re.ReplaceAllString(s, "\n")
-	re = regexp.MustCompile(`(?i)<[^>]+>`)
-	s = re.ReplaceAllString(s, "")
-	re = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
-	s = re.ReplaceAllString(s, "[IMAGEM]")
+	s = regexp.MustCompile(`(?i)<br\s*/?>|</p>|</li>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?i)<[^>]+>`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`).ReplaceAllString(s, "[IMAGEM]")
 	return strings.TrimSpace(s)
 }
 
@@ -766,14 +958,11 @@ func redactText(s string) string {
 	if !redactEnabled {
 		return s
 	}
-	re := regexp.MustCompile(`(?i)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
-	s = re.ReplaceAllString(s, "[email]")
-	re = regexp.MustCompile(`\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b`)
-	s = re.ReplaceAllString(s, "[cpf]")
-	re = regexp.MustCompile(`\(?\d{2}\)?[\s-]\d{4,5}[\s-]?\d{4}`)
-	s = re.ReplaceAllString(s, "[telefone]")
-	re = regexp.MustCompile(`https?://[^\s)>\]]+`)
-	s = re.ReplaceAllString(s, "[url]")
+
+	s = regexp.MustCompile(`(?i)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`).ReplaceAllString(s, "[email]")
+	s = regexp.MustCompile(`\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b`).ReplaceAllString(s, "[cpf]")
+	s = regexp.MustCompile(`\(?\d{2}\)?[\s-]\d{4,5}[\s-]?\d{4}`).ReplaceAllString(s, "[telefone]")
+	s = regexp.MustCompile(`https?://[^\s)>\]]+`).ReplaceAllString(s, "[url]")
 	return s
 }
 
@@ -781,28 +970,41 @@ func redactName(s string) string {
 	if !redactEnabled {
 		return s
 	}
+
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return s
 	}
+
 	parts := strings.Fields(s)
 	if len(parts) <= 1 {
 		return s
 	}
+
 	r := []rune(parts[1])
-	return parts[0] + " " + strings.ToUpper(string(r[0]))
+	return fmt.Sprintf("%s %s", parts[0], strings.ToUpper(string(r[0])))
 }
 
 func resolveFieldValue(obj map[string]any, base string, lookup map[int]string) string {
 	name := resolveName(obj, base)
-	if lookup != nil {
-		if id := displayInt(obj[base]); id > 0 {
-			if mapped, ok := lookup[id]; ok && mapped != "" {
-				return mapped
-			}
-		}
+	if lookup == nil {
+		return name
 	}
-	return name
+
+	id := displayInt(obj[base])
+	if id <= 0 {
+		return name
+	}
+
+	mapped, ok := lookup[id]
+	if !ok {
+		return name
+	}
+	if mapped == "" {
+		return name
+	}
+
+	return mapped
 }
 
 func inlineList(value any) string {
@@ -810,6 +1012,7 @@ func inlineList(value any) string {
 	if !ok {
 		return displayValue(value)
 	}
+
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
 		switch typed := it.(type) {
@@ -823,6 +1026,7 @@ func inlineList(value any) string {
 			parts = append(parts, displayValue(typed))
 		}
 	}
+
 	if len(parts) == 0 {
 		return displayValue(value)
 	}
@@ -836,15 +1040,9 @@ func displayValue(value any) string {
 	case string:
 		return strings.TrimSpace(typed)
 	case bool:
-		if typed {
-			return "sim"
-		}
-		return "não"
+		return boolText(typed)
 	case float64:
-		if typed == float64(int64(typed)) {
-			return strconv.Itoa(int(typed))
-		}
-		return strconv.FormatFloat(typed, 'f', 2, 64)
+		return floatText(typed)
 	case int:
 		return strconv.Itoa(typed)
 	case map[string]any:
@@ -859,6 +1057,20 @@ func displayValue(value any) string {
 	}
 }
 
+func boolText(v bool) string {
+	if v {
+		return SIM
+	}
+	return NAO
+}
+
+func floatText(v float64) string {
+	if v == float64(int64(v)) {
+		return strconv.Itoa(int(v))
+	}
+	return strconv.FormatFloat(v, 'f', 2, 64)
+}
+
 func displayBool(value any) bool {
 	switch typed := value.(type) {
 	case bool:
@@ -866,10 +1078,20 @@ func displayBool(value any) bool {
 	case float64:
 		return typed != 0
 	case string:
-		return typed == "true" || typed == "True" || typed == "1"
+		return truthyText(typed)
 	default:
 		return false
 	}
+}
+
+func truthyText(v string) bool {
+	if v == "true" {
+		return true
+	}
+	if v == "True" {
+		return true
+	}
+	return v == "1"
 }
 
 func displayInt(value any) int {
@@ -879,7 +1101,8 @@ func displayInt(value any) int {
 	case int:
 		return typed
 	case string:
-		if n, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+		n, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err == nil {
 			return n
 		}
 		return 0
@@ -896,7 +1119,7 @@ func stringOrEmpty(value any) string {
 }
 
 func singleValue(value any) string {
-	return "```json\n" + fmt.Sprintf("%v", value) + "\n```"
+	return fmt.Sprintf("```json\n%v\n```", value)
 }
 
 func formatInt(n int) string {
@@ -904,38 +1127,46 @@ func formatInt(n int) string {
 	if neg {
 		n = -n
 	}
+
 	s := strconv.Itoa(n)
-	var out strings.Builder
+	out := strings.Builder{}
 	for i, r := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
+		separate := i > 0
+		if separate {
+			separate = (len(s)-i)%3 == 0
+		}
+		if separate {
 			out.WriteByte('.')
 		}
 		out.WriteRune(r)
 	}
+
 	result := out.String()
 	if neg {
-		return "-" + result
+		return fmt.Sprintf("-%s", result)
 	}
 	return result
 }
 
 func formatDownload(result taiga.DownloadResult) string {
-	var b strings.Builder
+	b := strings.Builder{}
 	b.WriteString("Anexo salvo com sucesso ✅\n\n")
 	fmt.Fprintf(&b, "- **Caminho**: `%s`\n", result.Path)
 	fmt.Fprintf(&b, "- **Tamanho**: %s\n", formatFileSize(result.Bytes))
+
 	if result.ContentType != "" {
 		fmt.Fprintf(&b, "- **Tipo**: %s\n", result.ContentType)
 	}
+
 	return b.String()
 }
 
 func formatFileSize(bytes int64) string {
-	if bytes >= 1024*1024 {
-		return fmt.Sprintf("%.2f MB", float64(bytes)/(1024*1024))
+	if bytes >= MEGABYTE {
+		return fmt.Sprintf("%.2f MB", float64(bytes)/MEGABYTE)
 	}
-	if bytes >= 1024 {
-		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	if bytes >= KILOBYTE {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/KILOBYTE)
 	}
 	return fmt.Sprintf("%d bytes", bytes)
 }
@@ -943,16 +1174,20 @@ func formatFileSize(bytes int64) string {
 func formatPagination(meta taiga.ResponseMeta) string {
 	parts := []string{}
 	if meta.Total != "" {
-		parts = append(parts, "total de "+meta.Total+" registros")
+		parts = append(parts, fmt.Sprintf("total de %s registros", meta.Total))
 	}
+
 	if meta.CurrentPage != "" {
-		parts = append(parts, "página "+meta.CurrentPage)
+		page := fmt.Sprintf("página %s", meta.CurrentPage)
 		if meta.PaginatedBy != "" {
-			parts[len(parts)-1] += " (" + meta.PaginatedBy + " por página)"
+			page = fmt.Sprintf("%s (%s por página)", page, meta.PaginatedBy)
 		}
+		parts = append(parts, page)
 	}
+
 	if len(parts) == 0 {
 		return ""
 	}
-	return "📄 Paginação: " + strings.Join(parts, ", ") + "."
+
+	return fmt.Sprintf("📄 Paginação: %s.", strings.Join(parts, ", "))
 }

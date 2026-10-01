@@ -18,22 +18,31 @@ func TestRegisterBuildsToolSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	server := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
 	New(client).Register(server)
 }
 
 func TestChangeStatusCard(t *testing.T) {
-	var gotMethod, gotPath, gotBody string
+	gotMethod := ""
+	gotPath := ""
+	gotBody := ""
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPatch {
-			body, _ := io.ReadAll(r.Body)
-			gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"Ready"},"version":4}`)
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"version":3}`)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"version":3}`)
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"Ready"},"version":4}`)
 	}))
 	defer backend.Close()
 
@@ -41,6 +50,7 @@ func TestChangeStatusCard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	s := New(client)
 	cardID := 123
 	res, _, err := s.changeStatus(context.Background(), nil, ChangeStatusInput{
@@ -50,35 +60,47 @@ func TestChangeStatusCard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content, ok := res.Content[0].(*mcp.TextContent)
-	if !ok {
-		t.Fatalf("content = %#v, want TextContent", res.Content[0])
-	}
+	text := resultText(t, res)
+
 	for _, want := range []string{"✅ Card #5", "Em andamento → **Pronto**"} {
-		if !strings.Contains(content.Text, want) {
-			t.Errorf("output não contém %q:\n%s", want, content.Text)
+		if !strings.Contains(text, want) {
+			t.Errorf("output não contém %q:\n%s", want, text)
 		}
 	}
-	if gotMethod != http.MethodPatch || gotPath != "/api/v1/userstories/123" {
-		t.Errorf("PATCH = %s %s, want PATCH /api/v1/userstories/123", gotMethod, gotPath)
+
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", gotMethod)
 	}
+
+	if gotPath != "/api/v1/userstories/123" {
+		t.Errorf("path = %q, want /api/v1/userstories/123", gotPath)
+	}
+
 	if strings.TrimSpace(gotBody) != `{"status":7,"version":3}` {
 		t.Errorf("PATCH body = %q", gotBody)
 	}
 }
 
 func TestChangeStatusIssue(t *testing.T) {
-	var gotMethod, gotPath, gotBody string
+	gotMethod := ""
+	gotPath := ""
+	gotBody := ""
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPatch {
-			body, _ := io.ReadAll(r.Body)
-			gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"Ready"},"version":2}`)
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"New"},"version":1}`)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"New"},"version":1}`)
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
+		writeText(t, w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"Ready"},"version":2}`)
 	}))
 	defer backend.Close()
 
@@ -86,6 +108,7 @@ func TestChangeStatusIssue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	s := New(client)
 	issueID := 77
 	res, _, err := s.changeStatus(context.Background(), nil, ChangeStatusInput{
@@ -94,16 +117,24 @@ func TestChangeStatusIssue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, ok := res.Content[0].(*mcp.TextContent)
-	if !ok {
-		t.Fatalf("content = %#v, want TextContent", res.Content[0])
+
+	text := resultText(t, res)
+	if !strings.Contains(text, "✅ Issue #9") {
+		t.Errorf("output não contém issue:\n%s", text)
 	}
-	if !strings.Contains(content.Text, "✅ Issue #9") || !strings.Contains(content.Text, "Novo → **Pronto**") {
-		t.Errorf("output inesperado:\n%s", content.Text)
+
+	if !strings.Contains(text, "Novo → **Pronto**") {
+		t.Errorf("output não contém transição de status:\n%s", text)
 	}
-	if gotMethod != http.MethodPatch || gotPath != "/api/v1/issues/77" {
-		t.Errorf("PATCH = %s %s, want PATCH /api/v1/issues/77", gotMethod, gotPath)
+
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", gotMethod)
 	}
+
+	if gotPath != "/api/v1/issues/77" {
+		t.Errorf("path = %q, want /api/v1/issues/77", gotPath)
+	}
+
 	if strings.TrimSpace(gotBody) != `{"status":3,"version":1}` {
 		t.Errorf("PATCH body = %q", gotBody)
 	}
@@ -112,13 +143,14 @@ func TestChangeStatusIssue(t *testing.T) {
 func TestSearch(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
 		switch r.URL.Path {
 		case "/api/v1/userstories":
-			_, _ = io.WriteString(w, `[{"id":1,"ref":10,"subject":"Corrigir bug no login","status_extra_info":{"name":"Ready"},"assigned_to_extra_info":{},"project_extra_info":{"name":"App Mobile"}}]`)
+			writeText(t, w, `[{"id":1,"ref":10,"subject":"Corrigir bug no login","status_extra_info":{"name":"Ready"},"assigned_to_extra_info":{},"project_extra_info":{"name":"App Mobile"}}]`)
 		case "/api/v1/issues":
-			_, _ = io.WriteString(w, `[{"id":2,"ref":11,"subject":"Melhorar performance","status":5,"project_extra_info":{"name":"Plataforma Web"}}]`)
+			writeText(t, w, `[{"id":2,"ref":11,"subject":"Melhorar performance","status":5,"project_extra_info":{"name":"Plataforma Web"}}]`)
 		case "/api/v1/tasks":
-			_, _ = io.WriteString(w, `[]`)
+			writeText(t, w, `[]`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -129,33 +161,34 @@ func TestSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	s := New(client)
 
 	res, _, err := s.search(context.Background(), nil, SearchInput{Query: "bug"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, ok := res.Content[0].(*mcp.TextContent)
-	if !ok {
-		t.Fatalf("content = %#v, want TextContent", res.Content[0])
-	}
-	if !strings.Contains(content.Text, "1 resultado") || !strings.Contains(content.Text, "Card") || !strings.Contains(content.Text, "Corrigir bug no login") || !strings.Contains(content.Text, "App Mobile") || !strings.Contains(content.Text, "| Projeto |") {
-		t.Errorf("search output inesperado:\n%s", content.Text)
+
+	text := resultText(t, res)
+	for _, want := range []string{"1 resultado", "Card", "Corrigir bug no login", "App Mobile", "| Projeto |"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("search output não contém %q:\n%s", want, text)
+		}
 	}
 
 	res, _, err = s.search(context.Background(), nil, SearchInput{Query: "inexistente"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, _ = res.Content[0].(*mcp.TextContent)
-	if !strings.Contains(content.Text, "Nenhum resultado") {
-		t.Errorf("search vazio inesperado:\n%s", content.Text)
+
+	text = resultText(t, res)
+	if !strings.Contains(text, "Nenhum resultado") {
+		t.Errorf("search vazio inesperado:\n%s", text)
 	}
 }
 
-
 func TestAttachmentEndpoint(t *testing.T) {
-	for _, test := range []struct {
+	tests := []struct {
 		entity   string
 		expected string
 	}{
@@ -164,13 +197,21 @@ func TestAttachmentEndpoint(t *testing.T) {
 		{entity: "issue", expected: "/issues"},
 		{entity: "task", expected: "/tasks"},
 		{entity: "subtask", expected: "/tasks"},
-	} {
+	}
+
+	for _, test := range tests {
 		got, err := attachmentEndpoint(test.entity)
-		if err != nil || got != test.expected {
-			t.Fatalf("attachmentEndpoint(%q) = %q, %v; want %q", test.entity, got, err, test.expected)
+		if err != nil {
+			t.Fatalf("attachmentEndpoint(%q) error: %v", test.entity, err)
+		}
+
+		if got != test.expected {
+			t.Fatalf("attachmentEndpoint(%q) = %q, want %q", test.entity, got, test.expected)
 		}
 	}
-	if _, err := attachmentEndpoint("epic"); err == nil {
+
+	_, err := attachmentEndpoint("epic")
+	if err == nil {
 		t.Fatal("expected invalid entity error")
 	}
 }
@@ -180,19 +221,36 @@ func TestPaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if paginated || len(query) != 0 {
-		t.Fatalf("paging without values = %v, %#v; want false and empty query", paginated, query)
+
+	if paginated {
+		t.Fatalf("paging without values = %v, want false", paginated)
 	}
 
-	page, pageSize := 2, 50
+	if len(query) != 0 {
+		t.Fatalf("paging without values query = %#v, want empty", query)
+	}
+
+	page := 2
+	pageSize := 50
 	query, paginated, err = paging(&page, &pageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !paginated || query.Get("page") != "2" || query.Get("page_size") != "50" {
-		t.Fatalf("paging = %v, %#v", paginated, query)
+
+	if !paginated {
+		t.Fatal("paging = false, want true")
 	}
-	if _, _, err := paging(nil, intPointer(1001)); err == nil {
+
+	if query.Get("page") != "2" {
+		t.Errorf("page = %q, want 2", query.Get("page"))
+	}
+
+	if query.Get("page_size") != "50" {
+		t.Errorf("page_size = %q, want 50", query.Get("page_size"))
+	}
+
+	_, _, err = paging(nil, intPointer(1001))
+	if err == nil {
 		t.Fatal("expected page size validation error")
 	}
 }
@@ -205,3 +263,21 @@ func TestProjectSlugQueryIsEscaped(t *testing.T) {
 }
 
 func intPointer(value int) *int { return &value }
+
+func resultText(t *testing.T, res *mcp.CallToolResult) string {
+	t.Helper()
+
+	content, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content = %#v, want TextContent", res.Content[0])
+	}
+
+	return content.Text
+}
+
+func writeText(t *testing.T, w http.ResponseWriter, body string) {
+	t.Helper()
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Error(err)
+	}
+}

@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            taiga/go.sum
+            kimai/go.sum
+            gitlab/go.sum
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          for s in taiga kimai gitlab; do
+            (
+              cd "$s"
+              GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o ../dist/${s}-mcp.exe ./cmd/${s}-mcp
+            )
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/
+
+      - name: Publish rolling release (no tag needed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Latest build (${{ github.ref_name }})" \
+            --notes "Automatic build from ${{ github.ref_name }} (${{ github.sha }})."
+
+      - name: Publish tagged release (optional)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

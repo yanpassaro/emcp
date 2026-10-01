@@ -1,0 +1,93 @@
+version: '3'
+
+vars:
+  DIST: dist
+  GOOS: windows
+  GOARCH: amd64
+  CGO_ENABLED: '0'
+
+env:
+  GOOS: '{{.GOOS}}'
+  GOARCH: '{{.GOARCH}}'
+  CGO_ENABLED: '{{.CGO_ENABLED}}'
+
+tasks:
+  default:
+    desc: Build all MCP servers (.exe) into dist/
+    cmds:
+      - task: build
+
+  build:
+    desc: Build all MCP servers
+    deps:
+      - prep
+    cmds:
+      - task: build:taiga
+      - task: build:kimai
+      - task: build:gitlab
+
+  build:taiga:
+    desc: Build taiga-mcp.exe
+    dir: taiga
+    cmds:
+      - go build -o ../{{.DIST}}/taiga-mcp.exe ./cmd/taiga-mcp
+
+  build:kimai:
+    desc: Build kimai-mcp.exe
+    dir: kimai
+    cmds:
+      - go build -o ../{{.DIST}}/kimai-mcp.exe ./cmd/kimai-mcp
+
+  build:gitlab:
+    desc: Build gitlab-mcp.exe
+    dir: gitlab
+    cmds:
+      - go build -o ../{{.DIST}}/gitlab-mcp.exe ./cmd/gitlab-mcp
+
+  prep:
+    desc: Create the dist/ directory
+    internal: true
+    cmds:
+      - cmd: mkdir -p {{.DIST}}
+        ignore_error: true
+      - cmd: powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '{{.DIST}}' | Out-Null"
+        ignore_error: true
+
+  format:
+    desc: Format and clean all Go code (gofmt + go mod tidy + go vet)
+    cmds:
+      - task: format:taiga
+      - task: format:kimai
+      - task: format:gitlab
+
+  format:taiga:
+    desc: gofmt + tidy + vet in taiga
+    dir: taiga
+    cmds:
+      - gofmt -w .
+      - go mod tidy
+      - go vet ./...
+
+  format:kimai:
+    desc: gofmt + tidy + vet in kimai
+    dir: kimai
+    cmds:
+      - gofmt -w .
+      - go mod tidy
+      - go vet ./...
+
+  format:gitlab:
+    desc: gofmt + tidy + vet in gitlab
+    dir: gitlab
+    cmds:
+      - gofmt -w .
+      - go mod tidy
+      - go vet ./...
+
+  clean:
+    desc: Remove the dist/ directory
+    cmds:
+      - cmd: rm -rf {{.DIST}}
+        ignore_error: true
+      - cmd: powershell -NoProfile -Command "if (Test-Path '{{.DIST}}') { Remove-Item -Recurse -Force '{{.DIST}}' }"
+        ignore_error: true

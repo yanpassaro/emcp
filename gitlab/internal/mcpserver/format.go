@@ -380,6 +380,9 @@ func formatProjectsTable(items []any) string {
 		fmt.Fprintf(&b, "### %s\n", link(path, toStr(m["web_url"])))
 
 		pieces := []string{}
+		if id := toStr(m["id"]); id != "" {
+			pieces = append(pieces, fmt.Sprintf("🆔 %s", id))
+		}
 		if isNotZero(m, "star_count") {
 			pieces = append(pieces, fmt.Sprintf("⭐ %s", countLabel(m, "star_count")))
 		}
@@ -968,6 +971,7 @@ func formatProjectDetail(m map[string]any) string {
 	}
 
 	b.WriteString(metaLine(pieces...))
+	fmt.Fprintf(&b, "- **ID:** %s\n", orMissing(m["id"]))
 	fmt.Fprintf(&b, "- **Branch padrão:** %s\n", orMissing(m["default_branch"]))
 
 	if isNotZero(m, "open_issues_count") {

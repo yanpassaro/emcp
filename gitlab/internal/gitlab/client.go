@@ -89,16 +89,27 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{baseURL: u, token: token, httpClient: httpClient}, nil
 }
 
-func (c *Client) endpointURL(endpoint string, query url.Values) *url.URL {
+func (c *Client) endpointURL(endpoint string, query url.Values) (*url.URL, error) {
 	u := *c.baseURL
-	u.Path = fmt.Sprintf("%s/%s", strings.TrimRight(c.baseURL.Path, "/"), strings.TrimLeft(endpoint, "/"))
-	u.RawPath = ""
+	escaped := fmt.Sprintf("%s/%s", strings.TrimRight(u.EscapedPath(), "/"), strings.TrimLeft(endpoint, "/"))
+
+	parsed, err := url.Parse(escaped)
+	if err != nil {
+		return nil, fmt.Errorf("invalid GitLab endpoint: %w", err)
+	}
+
+	u.Path = parsed.Path
+	u.RawPath = parsed.RawPath
 	u.RawQuery = query.Encode()
-	return &u
+	return &u, nil
 }
 
 func (c *Client) do(ctx context.Context, endpoint string, query url.Values) (any, ResponseMeta, error) {
-	u := c.endpointURL(endpoint, query)
+	u, err := c.endpointURL(endpoint, query)
+	if err != nil {
+		return nil, ResponseMeta{}, err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, ResponseMeta{}, fmt.Errorf("create GitLab request: %w", err)

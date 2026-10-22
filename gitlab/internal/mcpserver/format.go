@@ -859,6 +859,140 @@ func metaLine(pieces ...string) string {
 	return fmt.Sprintf("%s\n", strings.Join(parts, " · "))
 }
 
+func diffEntries(raw any) []map[string]any {
+	items, ok := raw.([]any)
+	if ok {
+		return mapItems(items)
+	}
+
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	changes, ok := m["changes"].([]any)
+	if ok {
+		return mapItems(changes)
+	}
+
+	diffs, ok := m["diffs"].([]any)
+	if ok {
+		return mapItems(diffs)
+	}
+
+	return nil
+}
+
+func diffStat(diff string) (int, int) {
+	added := 0
+	removed := 0
+
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+++") {
+			continue
+		}
+		if strings.HasPrefix(line, "---") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") {
+			added++
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			removed++
+		}
+	}
+
+	return added, removed
+}
+
+func formatDiff(raw any, maxBytes int) string {
+	entries := diffEntries(raw)
+	if len(entries) == 0 {
+		return "Nenhuma alteração encontrada."
+	}
+
+	b := strings.Builder{}
+	used := 0
+	omitted := 0
+
+	for _, m := range entries {
+		diff := toStr(m["diff"])
+		if used >= maxBytes {
+			omitted++
+			continue
+		}
+
+		remaining := maxBytes - used
+		if len(diff) > remaining {
+			diff = diff[:remaining]
+		}
+
+		used += len(diff)
+		writeDiff(&b, m, diff)
+	}
+
+	if omitted != 0 {
+		fmt.Fprintf(&b, "⚠️ %d arquivo(s) omitido(s): diff maior que %s. Use sha/from/to mais específicos.\n", omitted, humanSize(maxBytes))
+	}
+
+	if diffOverflow(raw) {
+		b.WriteString("⚠️ O GitLab truncou a lista de alterações deste merge request. Consulte o MR no navegador para o diff completo.\n")
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func diffOverflow(raw any) bool {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	return isTrue(m["overflow"])
+}
+
+func writeDiff(b *strings.Builder, m map[string]any, diff string) {
+	oldPath := clean(toStr(m["old_path"]))
+	newPath := clean(toStr(m["new_path"]))
+
+	label := newPath
+	if oldPath != "" {
+		if oldPath != newPath {
+			label = fmt.Sprintf("%s → %s", oldPath, newPath)
+		}
+	}
+
+	added, removed := diffStat(diff)
+	fmt.Fprintf(b, "### `%s`\n", label)
+
+	pieces := []string{fmt.Sprintf("+%d −%d", added, removed)}
+	if isTrue(m["new_file"]) {
+		pieces = append(pieces, "novo")
+	}
+	if isTrue(m["deleted_file"]) {
+		pieces = append(pieces, "removido")
+	}
+	if isTrue(m["renamed_file"]) {
+		pieces = append(pieces, "renomeado")
+	}
+
+	b.WriteString(metaLine(pieces...))
+	b.WriteString("```diff\n")
+	b.WriteString(diff)
+	if !strings.HasSuffix(diff, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("```\n\n")
+}
+
+func isTrue(v any) bool {
+	b, ok := v.(bool)
+	if !ok {
+		return false
+	}
+	return b
+}
+
 func langFromPath(path string) string {
 	idx := strings.LastIndex(path, ".")
 	if idx >= 0 {

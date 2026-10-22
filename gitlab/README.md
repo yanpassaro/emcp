@@ -10,10 +10,13 @@ de arquivos de repositório. A saída é composta por tabelas Markdown organizad
 | Tool | Descrição |
 |---|---|
 | `gitlab_search` | Busca em vários escopos: projects, issues, merge_requests, milestones, users, commits, notes, wiki_blobs, blobs |
-| `gitlab_list` | Lista recursos (`entity=projects|users|issues|merge_requests|pipelines|branches|commits|members|tags|jobs`) com filtros |
+| `gitlab_list` | Lista recursos (`entity=projects|users|issues|merge_requests|pipelines|branches|commits|members|tags|jobs|tree`) com filtros |
 | `gitlab_get_item` | Item específico por `id` + `entity` (project|user|issue|merge_request|pipeline|branch|commit|member|tag|job) |
-| `gitlab_get_file` | Conteúdo de um arquivo do repositório (arquivos acima de 200KB são truncados) |
-| `gitlab_get_tree` | Árvore de arquivos do repositório (`path`/`ref`/`recursive`) |
+| `gitlab_get_file` | Conteúdo de arquivo(s) do repositório (`path` ou `paths` com até 20 arquivos, `ref`, faixa opcional via `line_start`/`line_end`; acima de 200KB é truncado) |
+| `gitlab_get_diff` | Diff de um merge request (`merge_request_iid`), de um commit (`sha`) ou entre refs (`from`/`to`) |
+
+Os campos `project_id` aceitam tanto o ID numérico (`42`) quanto o path completo
+(`grupo/projeto`).
 
 ## Build
 

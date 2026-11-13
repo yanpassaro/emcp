@@ -68,9 +68,9 @@ func (s *Server) Register(server *mcp.Server) {
 		Description: "Get a project (by project_id or slug) or a card/issue/task (by id or ref+project_id). Set 'entity' (project|card|issue|task).",
 	}, s.get)
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "taiga_change_status",
-		Description: "Change a card's, issue's or task's status. Set 'entity' plus 'status_id' (see taiga_get), and 'item_id' or 'ref'+'project_id'.",
-	}, s.changeStatus)
+		Name:        "taiga_change",
+		Description: "Change a card's, issue's or task's status and/or tags. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get) and/or 'add_tags'/'remove_tags'.",
+	}, s.change)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_search",
@@ -585,12 +585,14 @@ type ListItemsInput struct {
 	CountOnly    *bool  `json:"count_only,omitempty" jsonschema:"Return only the total count of matching items"`
 }
 
-type ChangeStatusInput struct {
-	Entity    string `json:"entity" jsonschema:"Object type: card, issue or task"`
-	ItemID    *int   `json:"item_id,omitempty" jsonschema:"Item ID"`
-	Ref       *int   `json:"ref,omitempty" jsonschema:"Item ref number"`
-	ProjectID *int   `json:"project_id,omitempty" jsonschema:"Project ID (required when using ref)"`
-	StatusID  int    `json:"status_id" jsonschema:"Target status ID (see taiga_get)"`
+type ChangeInput struct {
+	Entity     string   `json:"entity" jsonschema:"Object type: card, issue or task"`
+	ItemID     *int     `json:"item_id,omitempty" jsonschema:"Item ID"`
+	Ref        *int     `json:"ref,omitempty" jsonschema:"Item ref number"`
+	ProjectID  *int     `json:"project_id,omitempty" jsonschema:"Project ID (required when using ref)"`
+	StatusID   *int     `json:"status_id,omitempty" jsonschema:"Target status ID (see taiga_get)"`
+	AddTags    []string `json:"add_tags,omitempty" jsonschema:"Tags to add (use the project tags spelling)"`
+	RemoveTags []string `json:"remove_tags,omitempty" jsonschema:"Tags to remove"`
 }
 
 type AttachmentInput struct {
@@ -1127,12 +1129,136 @@ func (s *Server) fetchItem(ctx context.Context, base string, itemID, refValue, p
 	return &resolvedItem{obj: obj, id: id, version: version}, nil
 }
 
-func (s *Server) applyStatusChange(ctx context.Context, kind, base string, itemID, refValue, projectValue *int, statusID int, idLabel string) (*mcp.CallToolResult, any, error) {
-	if err := positive("status_id", statusID); err != nil {
+type tagEntry struct {
+	raw  any
+	name string
+}
+
+func tagEntries(value any) []tagEntry {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+
+	entries := make([]tagEntry, 0, len(items))
+	for _, item := range items {
+		switch typed := item.(type) {
+		case string:
+			entries = append(entries, tagEntry{raw: typed, name: typed})
+		case []any:
+			if len(typed) == 0 {
+				continue
+			}
+			entries = append(entries, tagEntry{raw: typed, name: displayValue(typed[0])})
+		}
+	}
+	return entries
+}
+
+func tagIndex(entries []tagEntry, name string) int {
+	for i, entry := range entries {
+		if strings.EqualFold(strings.TrimSpace(entry.name), name) {
+			return i
+		}
+	}
+	return -1
+}
+
+func mergeTags(current any, add, remove []string) []any {
+	entries := tagEntries(current)
+
+	for _, name := range remove {
+		tag := strings.TrimSpace(name)
+		if tag == "" {
+			continue
+		}
+
+		index := tagIndex(entries, tag)
+		if index >= 0 {
+			entries = append(entries[:index], entries[index+1:]...)
+		}
+	}
+
+	for _, name := range add {
+		tag := strings.TrimSpace(name)
+		if tag == "" {
+			continue
+		}
+
+		if tagIndex(entries, tag) >= 0 {
+			continue
+		}
+
+		entries = append(entries, tagEntry{raw: tag, name: tag})
+	}
+
+	raw := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		raw = append(raw, entry.raw)
+	}
+	return raw
+}
+
+func tagSummary(value any) string {
+	entries := tagEntries(value)
+	if len(entries) == 0 {
+		return "nenhuma"
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.name)
+	}
+	return tagList(names)
+}
+
+func tagList(names []string) string {
+	redacted := make([]string, 0, len(names))
+	for _, name := range names {
+		tag := strings.TrimSpace(name)
+		if tag == "" {
+			continue
+		}
+		redacted = append(redacted, redactText(tag))
+	}
+	return strings.Join(redacted, ", ")
+}
+
+func validateChange(input ChangeInput) error {
+	if input.StatusID != nil {
+		return nil
+	}
+
+	if len(input.AddTags) != 0 {
+		return nil
+	}
+
+	if len(input.RemoveTags) != 0 {
+		return nil
+	}
+
+	return errors.New("informe status_id, add_tags ou remove_tags")
+}
+
+func tagsRequested(input ChangeInput) bool {
+	if len(input.AddTags) != 0 {
+		return true
+	}
+	return len(input.RemoveTags) != 0
+}
+
+func (s *Server) applyChange(ctx context.Context, kind, base string, input ChangeInput, idLabel string) (*mcp.CallToolResult, any, error) {
+	if err := validateChange(input); err != nil {
 		return nil, nil, err
 	}
 
-	item, err := s.fetchItem(ctx, base, itemID, refValue, projectValue)
+	if input.StatusID != nil {
+		if err := positive("status_id", *input.StatusID); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	item, err := s.fetchItem(ctx, base, input.ItemID, input.Ref, input.ProjectID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1147,8 +1273,17 @@ func (s *Server) applyStatusChange(ctx context.Context, kind, base string, itemI
 
 	subject := redactText(displayValue(beforeObj["subject"]))
 
+	body := map[string]any{"version": item.version}
+	if input.StatusID != nil {
+		body["status"] = *input.StatusID
+	}
+
+	tags := mergeTags(beforeObj["tags"], input.AddTags, input.RemoveTags)
+	if tagsRequested(input) {
+		body["tags"] = tags
+	}
+
 	endpoint := fmt.Sprintf("%s/%d", base, item.id)
-	body := map[string]any{"status": statusID, "version": item.version}
 
 	after, _, err := s.client.PatchJSON(ctx, endpoint, nil, body)
 	if err != nil {
@@ -1159,21 +1294,37 @@ func (s *Server) applyStatusChange(ctx context.Context, kind, base string, itemI
 	if !ok {
 		afterObj = map[string]any{}
 	}
-	newStatus := translateStatus(resolveName(afterObj, "status"))
 
 	b := strings.Builder{}
 	fmt.Fprintf(&b, "✅ %s #%d: **%s**\n\n", kind, ref, subject)
-	fmt.Fprintf(&b, "- **Status:** %s → **%s**\n", oldStatus, newStatus)
+
+	if input.StatusID != nil {
+		newStatus := translateStatus(resolveName(afterObj, "status"))
+		fmt.Fprintf(&b, "- **Status:** %s → **%s**\n", oldStatus, newStatus)
+	}
+
+	if len(input.AddTags) != 0 {
+		fmt.Fprintf(&b, "- **Tags adicionadas:** %s\n", tagList(input.AddTags))
+	}
+
+	if len(input.RemoveTags) != 0 {
+		fmt.Fprintf(&b, "- **Tags removidas:** %s\n", tagList(input.RemoveTags))
+	}
+
+	if tagsRequested(input) {
+		fmt.Fprintf(&b, "- **Tags atuais:** %s\n", tagSummary(tags))
+	}
+
 	fmt.Fprintf(&b, "- **%s:** %d\n", idLabel, item.id)
 	return textResult(b.String())
 }
 
-func (s *Server) changeStatus(ctx context.Context, _ *mcp.CallToolRequest, input ChangeStatusInput) (*mcp.CallToolResult, any, error) {
+func (s *Server) change(ctx context.Context, _ *mcp.CallToolRequest, input ChangeInput) (*mcp.CallToolResult, any, error) {
 	base, kind, idLabel, err := itemBase(input.Entity)
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.applyStatusChange(ctx, kind, base, input.ItemID, input.Ref, input.ProjectID, input.StatusID, idLabel)
+	return s.applyChange(ctx, kind, base, input, idLabel)
 }
 
 func itemBase(entity string) (base, kind, idLabel string, err error) {

@@ -53,8 +53,8 @@ func TestChangeStatusCard(t *testing.T) {
 
 	s := New(client)
 	cardID := 123
-	res, _, err := s.changeStatus(context.Background(), nil, ChangeStatusInput{
-		Entity: "card", ItemID: &cardID, StatusID: 7,
+	res, _, err := s.change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, StatusID: intPointer(7),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -111,8 +111,8 @@ func TestChangeStatusIssue(t *testing.T) {
 
 	s := New(client)
 	issueID := 77
-	res, _, err := s.changeStatus(context.Background(), nil, ChangeStatusInput{
-		Entity: "issue", ItemID: &issueID, StatusID: 3,
+	res, _, err := s.change(context.Background(), nil, ChangeInput{
+		Entity: "issue", ItemID: &issueID, StatusID: intPointer(3),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +137,80 @@ func TestChangeStatusIssue(t *testing.T) {
 
 	if strings.TrimSpace(gotBody) != `{"status":3,"version":1}` {
 		t.Errorf("PATCH body = %q", gotBody)
+	}
+}
+
+func TestChangeTagsCard(t *testing.T) {
+	gotMethod := ""
+	gotPath := ""
+	gotBody := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"tags":["bug",["urgente","#ff0000"]],"version":3}`)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"tags":["bug","antiga"],"version":4}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(client)
+	cardID := 123
+	res, _, err := s.change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, AddTags: []string{"antiga"}, RemoveTags: []string{"Urgente"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+
+	for _, want := range []string{"✅ Card #5", "Tags adicionadas:** antiga", "Tags removidas:** Urgente", "Tags atuais:** bug, antiga"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output não contém %q:\n%s", want, text)
+		}
+	}
+
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", gotMethod)
+	}
+
+	if gotPath != "/api/v1/userstories/123" {
+		t.Errorf("path = %q, want /api/v1/userstories/123", gotPath)
+	}
+
+	if strings.TrimSpace(gotBody) != `{"tags":["bug","antiga"],"version":3}` {
+		t.Errorf("PATCH body = %q", gotBody)
+	}
+}
+
+func TestChangeRequiresTarget(t *testing.T) {
+	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(client)
+	cardID := 123
+	_, _, err = s.change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID,
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
 	}
 }
 

@@ -69,7 +69,7 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.get)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_change",
-		Description: "Change a card's, issue's or task's status and/or tags. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get) and/or 'add_tags'/'remove_tags'.",
+		Description: "Change a card's, issue's or task's status, assignees and/or tags. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users' and/or 'add_tags'/'remove_tags'.",
 	}, s.change)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -586,13 +586,15 @@ type ListItemsInput struct {
 }
 
 type ChangeInput struct {
-	Entity     string   `json:"entity" jsonschema:"Object type: card, issue or task"`
-	ItemID     *int     `json:"item_id,omitempty" jsonschema:"Item ID"`
-	Ref        *int     `json:"ref,omitempty" jsonschema:"Item ref number"`
-	ProjectID  *int     `json:"project_id,omitempty" jsonschema:"Project ID (required when using ref)"`
-	StatusID   *int     `json:"status_id,omitempty" jsonschema:"Target status ID (see taiga_get)"`
-	AddTags    []string `json:"add_tags,omitempty" jsonschema:"Tags to add (use the project tags spelling)"`
-	RemoveTags []string `json:"remove_tags,omitempty" jsonschema:"Tags to remove"`
+	Entity        string   `json:"entity" jsonschema:"Object type: card, issue or task"`
+	ItemID        *int     `json:"item_id,omitempty" jsonschema:"Item ID"`
+	Ref           *int     `json:"ref,omitempty" jsonschema:"Item ref number"`
+	ProjectID     *int     `json:"project_id,omitempty" jsonschema:"Project ID (required when using ref)"`
+	StatusID      *int     `json:"status_id,omitempty" jsonschema:"Target status ID (see taiga_get)"`
+	AssignedTo    *int     `json:"assigned_to,omitempty" jsonschema:"Primary assignee user ID (single, legacy field)"`
+	AssignedUsers []int    `json:"assigned_users,omitempty" jsonschema:"Full list of assignee user IDs; replaces the current assignees (empty list clears; assigned_to is cleared when omitted)"`
+	AddTags       []string `json:"add_tags,omitempty" jsonschema:"Tags to add (use the project tags spelling)"`
+	RemoveTags    []string `json:"remove_tags,omitempty" jsonschema:"Tags to remove"`
 }
 
 type AttachmentInput struct {
@@ -1229,6 +1231,14 @@ func validateChange(input ChangeInput) error {
 		return nil
 	}
 
+	if input.AssignedTo != nil {
+		return nil
+	}
+
+	if input.AssignedUsers != nil {
+		return nil
+	}
+
 	if len(input.AddTags) != 0 {
 		return nil
 	}
@@ -1237,7 +1247,7 @@ func validateChange(input ChangeInput) error {
 		return nil
 	}
 
-	return errors.New("informe status_id, add_tags ou remove_tags")
+	return errors.New("informe status_id, assigned_to, assigned_users, add_tags ou remove_tags")
 }
 
 func tagsRequested(input ChangeInput) bool {
@@ -1247,6 +1257,63 @@ func tagsRequested(input ChangeInput) bool {
 	return len(input.RemoveTags) != 0
 }
 
+func assignRequested(input ChangeInput) bool {
+	if input.AssignedTo != nil {
+		return true
+	}
+	return input.AssignedUsers != nil
+}
+
+func assigneeIDs(obj map[string]any) []int {
+	raw, ok := obj["assigned_users"].([]any)
+	if !ok {
+		primary := displayInt(obj["assigned_to"])
+		if primary <= 0 {
+			return nil
+		}
+		return []int{primary}
+	}
+
+	ids := make([]int, 0, len(raw))
+	for _, item := range raw {
+		id := displayInt(item)
+		if id <= 0 {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+func assigneeLabel(ids []int) string {
+	if len(ids) > 1 {
+		return "Responsáveis"
+	}
+	return "Responsável"
+}
+
+func assigneeSummary(obj map[string]any, ids []int) string {
+	if len(ids) == 0 {
+		return "ninguém"
+	}
+
+	name := redactName(resolveName(obj, "assigned_to"))
+	primary := displayInt(obj["assigned_to"])
+
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == primary {
+			if name != "" {
+				parts = append(parts, fmt.Sprintf("%s (%d)", name, id))
+				continue
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%d", id))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (s *Server) applyChange(ctx context.Context, kind, base string, input ChangeInput, idLabel string) (*mcp.CallToolResult, any, error) {
 	if err := validateChange(input); err != nil {
 		return nil, nil, err
@@ -1254,6 +1321,12 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 
 	if input.StatusID != nil {
 		if err := positive("status_id", *input.StatusID); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if input.AssignedTo != nil {
+		if err := positive("assigned_to", *input.AssignedTo); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -1276,6 +1349,17 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 	body := map[string]any{"version": item.version}
 	if input.StatusID != nil {
 		body["status"] = *input.StatusID
+	}
+
+	if input.AssignedTo != nil {
+		body["assigned_to"] = *input.AssignedTo
+	}
+
+	if input.AssignedUsers != nil {
+		body["assigned_users"] = input.AssignedUsers
+		if input.AssignedTo == nil {
+			body["assigned_to"] = nil
+		}
 	}
 
 	tags := mergeTags(beforeObj["tags"], input.AddTags, input.RemoveTags)
@@ -1301,6 +1385,11 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 	if input.StatusID != nil {
 		newStatus := translateStatus(resolveName(afterObj, "status"))
 		fmt.Fprintf(&b, "- **Status:** %s → **%s**\n", oldStatus, newStatus)
+	}
+
+	if assignRequested(input) {
+		ids := assigneeIDs(afterObj)
+		fmt.Fprintf(&b, "- **%s:** %s\n", assigneeLabel(ids), assigneeSummary(afterObj, ids))
 	}
 
 	if len(input.AddTags) != 0 {

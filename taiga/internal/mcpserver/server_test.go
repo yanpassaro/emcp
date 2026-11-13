@@ -198,6 +198,109 @@ func TestChangeTagsCard(t *testing.T) {
 	}
 }
 
+func TestChangeAssignees(t *testing.T) {
+	gotMethod := ""
+	gotPath := ""
+	gotBody := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"assigned_to":1,"assigned_to_extra_info":{"id":1,"full_name_display":"Ana"},"assigned_users":[1,2],"version":3}`)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(body)
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","status_extra_info":{"name":"In Progress"},"assigned_to":null,"assigned_users":[2,3],"version":4}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(client)
+	cardID := 123
+	res, _, err := s.change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, AssignedUsers: []int{3, 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+
+	for _, want := range []string{"✅ Card #5", "Responsáveis:** 2, 3"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output não contém %q:\n%s", want, text)
+		}
+	}
+
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", gotMethod)
+	}
+
+	if gotPath != "/api/v1/userstories/123" {
+		t.Errorf("path = %q, want /api/v1/userstories/123", gotPath)
+	}
+
+	if strings.TrimSpace(gotBody) != `{"assigned_to":null,"assigned_users":[3,2],"version":3}` {
+		t.Errorf("PATCH body = %q", gotBody)
+	}
+}
+
+func TestChangeAssignedTo(t *testing.T) {
+	gotBody := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"New"},"version":1}`)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotBody = string(body)
+		writeText(t, w, `{"id":77,"ref":9,"subject":"Bug no login","status_extra_info":{"name":"New"},"assigned_to":4,"assigned_to_extra_info":{"id":4,"full_name_display":"Bruno"},"assigned_users":[4],"version":2}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(client)
+	issueID := 77
+	res, _, err := s.change(context.Background(), nil, ChangeInput{
+		Entity: "issue", ItemID: &issueID, AssignedTo: intPointer(4),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+	if !strings.Contains(text, "Responsável:** Bruno (4)") {
+		t.Errorf("output não contém responsável:\n%s", text)
+	}
+
+	if strings.TrimSpace(gotBody) != `{"assigned_to":4,"version":1}` {
+		t.Errorf("PATCH body = %q", gotBody)
+	}
+}
+
 func TestChangeRequiresTarget(t *testing.T) {
 	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
 	if err != nil {

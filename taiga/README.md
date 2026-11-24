@@ -10,7 +10,7 @@ PII ativada por padrão) em vez de JSON cru.
 | Tool | Descrição |
 |---|---|
 | `taiga_list` | Lista projetos, cards, issues, tasks ou atividade recente (`entity=project|card|issue|task|activity`) com filtros; `count_only` retorna só o total. Em `activity`, use `project_id` (opcional), `my=true` e `card_id`/`issue_id`/`task_id` para histórico de um item |
-| `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug) ou de um card/issue/task (`entity=card|issue|task` + id/ref) |
+| `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug), de um card/issue/task (`entity=card|issue|task` + id/ref) ou do seu usuário (`entity=info`: id, username, nome, e-mail, papéis e os projetos em que você participa) |
 | `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`) |
 | `taiga_search` | Busca cards, issues e tasks por assunto/ref |
 | `taiga_attachment` | Lista (`action=list`) ou baixa (`action=download`) anexos de um item |

@@ -76,6 +76,65 @@ func formatProjectsTable(data any, meta taiga.ResponseMeta) string {
 	return b.String()
 }
 
+func formatUserInfo(user map[string]any, projects any, meta taiga.ResponseMeta) string {
+	b := strings.Builder{}
+
+	name := redactText(displayValue(user["full_name"]))
+	if name == "" {
+		name = stringOrEmpty(user["username"])
+	}
+	fmt.Fprintf(&b, "# %s\n\n", name)
+
+	lines := []string{fmt.Sprintf("**ID:** %s", displayValue(user["id"]))}
+
+	username := stringOrEmpty(user["username"])
+	if username != "" {
+		lines = append(lines, fmt.Sprintf("**Username:** `%s`", username))
+	}
+
+	email := redactText(stringOrEmpty(user["email"]))
+	if email != "" {
+		lines = append(lines, fmt.Sprintf("**E-mail:** %s", email))
+	}
+
+	roles := inlineList(user["roles"])
+	if roles != "" {
+		lines = append(lines, fmt.Sprintf("**Papéis:** %s", roles))
+	}
+
+	lines = append(lines, fmt.Sprintf("**Ativo:** %s", yesNoFlag(user["is_active"])))
+	b.WriteString(strings.Join(lines, " | "))
+	b.WriteString("\n\n")
+
+	dates := []string{}
+	joined := shortDate(user, "date_joined")
+	if joined != "" {
+		dates = append(dates, fmt.Sprintf("**Membro desde:** %s", joined))
+	}
+	lastLogin := shortDate(user, "last_login")
+	if lastLogin != "" {
+		dates = append(dates, fmt.Sprintf("**Último acesso:** %s", lastLogin))
+	}
+	if len(dates) > 0 {
+		b.WriteString(strings.Join(dates, " | "))
+		b.WriteString("\n\n")
+	}
+
+	items, ok := projects.([]any)
+	if !ok {
+		b.WriteString(formatProjectsTable(projects, meta))
+		return strings.TrimSpace(b.String())
+	}
+	if len(items) == 0 {
+		b.WriteString("## Projetos\n\nNenhum projeto encontrado.\n")
+		return strings.TrimSpace(b.String())
+	}
+
+	fmt.Fprintf(&b, "## Projetos que participo (%s)\n\n", formatInt(len(items)))
+	b.WriteString(formatProjectsTable(projects, meta))
+	return strings.TrimSpace(b.String())
+}
+
 func formatCardsTable(data any, meta taiga.ResponseMeta) string {
 	items, ok := data.([]any)
 	if !ok {

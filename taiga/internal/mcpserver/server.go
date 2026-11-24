@@ -65,7 +65,7 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.listItems)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_get",
-		Description: "Get a project (by project_id or slug) or a card/issue/task (by id or ref+project_id). Set 'entity' (project|card|issue|task).",
+		Description: "Get a project (by project_id or slug), a card/issue/task (by id or ref+project_id), or your own user (entity=info: id, username, name, email, roles and the projects you are a member of). Set 'entity' (project|card|issue|task|info).",
 	}, s.get)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_change",
@@ -533,6 +533,36 @@ func parseActivityTime(value string) time.Time {
 	return parsed
 }
 
+func (s *Server) getInfo(ctx context.Context) (*mcp.CallToolResult, any, error) {
+	raw, _, err := s.client.GetJSON(ctx, "/users/me", url.Values{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	user, ok := raw.(map[string]any)
+	if !ok {
+		return nil, nil, errors.New("usuário atual inválido")
+	}
+
+	userID := displayInt(user["id"])
+	if userID <= 0 {
+		return nil, nil, errors.New("usuário atual sem id")
+	}
+
+	query := url.Values{
+		"member":    []string{strconv.Itoa(userID)},
+		"page":      []string{"1"},
+		"page_size": []string{strconv.Itoa(DEFAULT_LIST_LIMIT)},
+	}
+
+	projects, meta, err := s.client.ListJSON(ctx, "/projects", query, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return textResult(formatUserInfo(user, projects, meta))
+}
+
 func (s *Server) loadCurrentUser(ctx context.Context) int {
 	raw, _, err := s.client.GetJSON(ctx, "/users/me", url.Values{})
 	if err != nil {
@@ -546,7 +576,7 @@ func (s *Server) loadCurrentUser(ctx context.Context) int {
 }
 
 type GetInput struct {
-	Entity        string `json:"entity" jsonschema:"Object type: project, card, issue or task"`
+	Entity        string `json:"entity" jsonschema:"Object type: project, card, issue, task or info"`
 	ID            *int   `json:"id,omitempty" jsonschema:"Item ID (cards/issues/tasks)"`
 	Ref           *int   `json:"ref,omitempty" jsonschema:"Item ref number (cards/issues/tasks)"`
 	ProjectID     *int   `json:"project_id,omitempty" jsonschema:"Project ID (to fetch a project by ID, or required when using ref)"`
@@ -1037,11 +1067,22 @@ func isProjectEntity(entity string) bool {
 	return entity == "projects"
 }
 
+func isInfoEntity(entity string) bool {
+	if entity == "info" {
+		return true
+	}
+	return entity == "me"
+}
+
 func (s *Server) get(ctx context.Context, _ *mcp.CallToolRequest, input GetInput) (*mcp.CallToolResult, any, error) {
 	entity := strings.ToLower(strings.TrimSpace(input.Entity))
 
 	if isProjectEntity(entity) {
 		return s.getProject(ctx, input)
+	}
+
+	if isInfoEntity(entity) {
+		return s.getInfo(ctx)
 	}
 
 	if (input.ID == nil) == (input.Ref == nil) {

@@ -23,6 +23,53 @@ func TestRegisterBuildsToolSchemas(t *testing.T) {
 	New(client).Register(server)
 }
 
+func TestInfo(t *testing.T) {
+	gotMember := ""
+	gotPageSize := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/users/me":
+			writeText(t, w, `{"id":42,"username":"yann","full_name":"Yann Pessoa","email":"«email:4a9e0b4ffbb3»","roles":["Member"],"is_active":true,"date_joined":"2024-03-10T12:00:00Z","last_login":"2026-11-20T09:30:00Z"}`)
+		case "/api/v1/projects":
+			gotMember = r.URL.Query().Get("member")
+			gotPageSize = r.URL.Query().Get("page_size")
+			writeText(t, w, `[{"id":7,"name":"Portal","slug":"portal","created_date":"2025-01-08T10:00:00Z","total_activity":123,"i_am_admin":true}]`)
+		default:
+			t.Errorf("caminho inesperado: %s", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := New(client).get(context.Background(), nil, GetInput{Entity: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+
+	for _, want := range []string{"# Yann Pessoa", "**ID:** 42", "`yann`", "**Papéis:** Member", "## Projetos que participo (1)", "Portal", "`portal`"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output não contém %q:\n%s", want, text)
+		}
+	}
+
+	if gotMember != "42" {
+		t.Errorf("member = %q, want 42", gotMember)
+	}
+
+	if gotPageSize != "50" {
+		t.Errorf("page_size = %q, want 50", gotPageSize)
+	}
+}
+
 func TestChangeStatusCard(t *testing.T) {
 	gotMethod := ""
 	gotPath := ""

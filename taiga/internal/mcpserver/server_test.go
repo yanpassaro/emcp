@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -67,6 +69,166 @@ func TestInfo(t *testing.T) {
 
 	if gotPageSize != "50" {
 		t.Errorf("page_size = %q, want 50", gotPageSize)
+	}
+}
+
+func TestCommentPosted(t *testing.T) {
+	gotBody := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPatch {
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3}`)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotBody = string(body)
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":4}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	res, _, err := New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, Comment: "Segue o ajuste combinado com o time.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(gotBody, `"comment":"Segue o ajuste combinado com o time."`) {
+		t.Errorf("PATCH body = %q, sem comment", gotBody)
+	}
+
+	if !strings.Contains(gotBody, `"version":3`) {
+		t.Errorf("PATCH body = %q, sem version", gotBody)
+	}
+
+	text := resultText(t, res)
+	if !strings.Contains(text, "Comentário publicado") {
+		t.Errorf("output não confirma o comentário:\n%s", text)
+	}
+}
+
+func TestCommentRejected(t *testing.T) {
+	gotMethod := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		gotMethod = r.Method
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	_, _, err = New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, Comment: "a senha=SuperSecreta123 do banco",
+	})
+	if err == nil {
+		t.Fatal("esperava bloqueio do comentário")
+	}
+
+	if !strings.Contains(err.Error(), "política de conteúdo") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+
+	if gotMethod == http.MethodPatch {
+		t.Fatal("o PATCH não deveria ter sido enviado")
+	}
+}
+
+func TestUploadRejectedOutsideDirs(t *testing.T) {
+	allowed := t.TempDir()
+	outside := t.TempDir()
+	file := filepath.Join(outside, "nota.txt")
+	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TAIGA_UPLOAD_DIRS", allowed)
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = New(client).attachment(context.Background(), nil, AttachmentInput{
+		Entity: "card", Action: "upload", ObjectID: 1, ProjectID: 2, SourcePath: file,
+	})
+	if err == nil {
+		t.Fatal("esperava recusa do upload")
+	}
+
+	if !strings.Contains(err.Error(), "TAIGA_UPLOAD_DIRS") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+}
+
+func TestUploadAccepted(t *testing.T) {
+	allowed := t.TempDir()
+	file := filepath.Join(allowed, "nota.txt")
+	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TAIGA_UPLOAD_DIRS", allowed)
+
+	gotPath := ""
+	gotBody := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+
+		gotPath = r.URL.Path
+		gotBody = string(body)
+		writeText(t, w, `{"id":9,"name":"nota.txt"}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := New(client).attachment(context.Background(), nil, AttachmentInput{
+		Entity: "card", Action: "upload", ObjectID: 1, ProjectID: 2, SourcePath: file, Description: "resumo do alinhamento",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotPath != "/api/v1/userstories/attachments" {
+		t.Errorf("path = %q", gotPath)
+	}
+
+	for _, want := range []string{`name="object_id"`, `name="project_id"`, `filename="nota.txt"`, "combinado por escrito"} {
+		if !strings.Contains(gotBody, want) {
+			t.Errorf("multipart sem %q:\n%s", want, gotBody)
+		}
+	}
+
+	if !strings.Contains(resultText(t, res), "Anexo enviado") {
+		t.Errorf("output sem confirmação")
 	}
 }
 

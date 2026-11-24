@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"ntdsk.com/taiga/internal/policy"
 	"ntdsk.com/taiga/internal/taiga"
 )
 
@@ -25,6 +26,7 @@ const (
 	MAX_SEARCH_LIMIT        = 30
 	DEFAULT_PROJECT_ACTIVES = 5
 	MAX_PROJECT_ACTIVES     = 20
+	DEFAULT_MAX_UPLOAD_MB   = 10
 	MAX_PAGE_SIZE           = 1000
 	CARD                    = "card"
 	ISSUE                   = "issue"
@@ -34,6 +36,7 @@ const (
 
 type Server struct {
 	client *taiga.Client
+	guard  *policy.Guard
 }
 
 var redactEnabled = true
@@ -55,7 +58,53 @@ func New(client *taiga.Client) *Server {
 	if redactDisabled(strings.ToLower(strings.TrimSpace(os.Getenv("TAIGA_REDACT")))) {
 		redactEnabled = false
 	}
-	return &Server{client: client}
+
+	guard := policy.New(policy.Options{
+		BannedWords:     envList("TAIGA_BANNED_WORDS"),
+		BannedWordsFile: strings.TrimSpace(os.Getenv("TAIGA_BANNED_WORDS_FILE")),
+		UploadDirs:      envList("TAIGA_UPLOAD_DIRS"),
+		MaxUploadBytes:  int64(envInt("TAIGA_MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * MEGABYTE,
+		AllowArchives:   envTrue("TAIGA_UPLOAD_ALLOW_ARCHIVES"),
+	})
+
+	return &Server{client: client, guard: guard}
+}
+
+func envList(name string) []string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return nil
+	}
+
+	out := []string{}
+	for _, part := range strings.Split(value, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func envInt(name string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil {
+		return fallback
+	}
+	if n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func envTrue(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) Register(server *mcp.Server) {
@@ -69,7 +118,7 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.get)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_change",
-		Description: "Change a card's, issue's or task's status, assignees and/or tags. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users' and/or 'add_tags'/'remove_tags'.",
+		Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. The comment is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
 	}, s.change)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -78,7 +127,7 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.search)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_attachment",
-		Description: "List or download attachments of a card, issue or task. Set 'entity' and 'action' (list|download). 'list' requires object_id & project_id; 'download' requires attachment_id.",
+		Description: "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (a file inside TAIGA_UPLOAD_DIRS, screened for credentials, PII and blocked extensions).",
 	}, s.attachment)
 }
 
@@ -625,16 +674,19 @@ type ChangeInput struct {
 	AssignedUsers []int    `json:"assigned_users,omitempty" jsonschema:"Full list of assignee user IDs; replaces the current assignees (empty list clears; assigned_to is cleared when omitted)"`
 	AddTags       []string `json:"add_tags,omitempty" jsonschema:"Tags to add (use the project tags spelling)"`
 	RemoveTags    []string `json:"remove_tags,omitempty" jsonschema:"Tags to remove"`
+	Comment       string   `json:"comment,omitempty" jsonschema:"Comment to post on the item (screened for profanity, credentials, PII and internal hosts before posting)"`
 }
 
 type AttachmentInput struct {
 	Entity       string `json:"entity" jsonschema:"Object type: card, issue or task"`
-	Action       string `json:"action" jsonschema:"Action: 'list' or 'download'"`
-	ObjectID     int    `json:"object_id,omitempty" jsonschema:"Item ID (required for action=list)"`
-	ProjectID    int    `json:"project_id,omitempty" jsonschema:"Project ID (required for action=list)"`
+	Action       string `json:"action" jsonschema:"Action: 'list', 'download' or 'upload'"`
+	ObjectID     int    `json:"object_id,omitempty" jsonschema:"Item ID (required for action=list and action=upload)"`
+	ProjectID    int    `json:"project_id,omitempty" jsonschema:"Project ID (required for action=list and action=upload)"`
 	AttachmentID int    `json:"attachment_id,omitempty" jsonschema:"Attachment ID (required for action=download)"`
 	Filename     string `json:"filename,omitempty" jsonschema:"Output filename (defaults to Taiga's name)"`
 	Path         string `json:"path,omitempty" jsonschema:"Output path (defaults to the configured directory)"`
+	SourcePath   string `json:"source_path,omitempty" jsonschema:"Local file to upload (required for action=upload); must resolve inside TAIGA_UPLOAD_DIRS"`
+	Description  string `json:"description,omitempty" jsonschema:"Attachment description (action=upload; screened like a comment)"`
 }
 
 func itemCountLabel(isCard, isIssue bool) string {
@@ -1268,6 +1320,10 @@ func tagList(names []string) string {
 }
 
 func validateChange(input ChangeInput) error {
+	if strings.TrimSpace(input.Comment) != "" {
+		return nil
+	}
+
 	if input.StatusID != nil {
 		return nil
 	}
@@ -1288,7 +1344,7 @@ func validateChange(input ChangeInput) error {
 		return nil
 	}
 
-	return errors.New("informe status_id, assigned_to, assigned_users, add_tags ou remove_tags")
+	return errors.New("informe status_id, assigned_to, assigned_users, add_tags, remove_tags ou comment")
 }
 
 func tagsRequested(input ChangeInput) bool {
@@ -1408,6 +1464,14 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 		body["tags"] = tags
 	}
 
+	comment := strings.TrimSpace(input.Comment)
+	if comment != "" {
+		if err := s.guard.Comment(comment); err != nil {
+			return nil, nil, err
+		}
+		body["comment"] = comment
+	}
+
 	endpoint := fmt.Sprintf("%s/%d", base, item.id)
 
 	after, _, err := s.client.PatchJSON(ctx, endpoint, nil, body)
@@ -1443,6 +1507,12 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 
 	if tagsRequested(input) {
 		fmt.Fprintf(&b, "- **Tags atuais:** %s\n", tagSummary(tags))
+	}
+
+	if comment != "" {
+		b.WriteString("\n### 💬 Comentário publicado\n\n")
+		b.WriteString(comment)
+		b.WriteString("\n")
 	}
 
 	fmt.Fprintf(&b, "- **%s:** %d\n", idLabel, item.id)
@@ -1661,6 +1731,38 @@ func (s *Server) downloadAttachment(ctx context.Context, endpoint string, input 
 	return textResult(formatDownload(result))
 }
 
+func (s *Server) uploadAttachment(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
+	if err := positive("project_id", input.ProjectID); err != nil {
+		return nil, nil, err
+	}
+
+	if err := positive("object_id", input.ObjectID); err != nil {
+		return nil, nil, err
+	}
+
+	path, size, err := s.guard.Attachment(input.SourcePath, input.Description)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fields := map[string]string{
+		"object_id":  strconv.Itoa(input.ObjectID),
+		"project_id": strconv.Itoa(input.ProjectID),
+	}
+
+	description := strings.TrimSpace(input.Description)
+	if description != "" {
+		fields["description"] = description
+	}
+
+	data, _, err := s.client.Upload(ctx, fmt.Sprintf("%s/attachments", endpoint), fields, "attached_file", path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return textResult(formatUpload(path, size, data))
+}
+
 func (s *Server) attachment(ctx context.Context, _ *mcp.CallToolRequest, input AttachmentInput) (*mcp.CallToolResult, any, error) {
 	endpoint, err := attachmentEndpoint(input.Entity)
 	if err != nil {
@@ -1672,8 +1774,10 @@ func (s *Server) attachment(ctx context.Context, _ *mcp.CallToolRequest, input A
 		return s.listAttachments(ctx, endpoint, input)
 	case "download":
 		return s.downloadAttachment(ctx, endpoint, input)
+	case "upload":
+		return s.uploadAttachment(ctx, endpoint, input)
 	default:
-		return nil, nil, errors.New("action deve ser 'list' ou 'download'")
+		return nil, nil, errors.New("action deve ser 'list', 'download' ou 'upload'")
 	}
 }
 

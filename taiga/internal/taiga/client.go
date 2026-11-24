@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -477,6 +478,66 @@ func (c *Client) Download(ctx context.Context, rawURL string, filename string, d
 		ContentType: resp.Header.Get("Content-Type"),
 		SourceURL:   source.String(),
 	}, nil
+}
+
+func (c *Client) Upload(ctx context.Context, endpoint string, fields map[string]string, fieldName, filePath string) (any, ResponseMeta, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("open upload file: %w", err)
+	}
+	defer file.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			return nil, ResponseMeta{}, fmt.Errorf("write upload field %s: %w", key, err)
+		}
+	}
+
+	part, err := writer.CreateFormFile(fieldName, filepath.Base(filePath))
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("create upload part: %w", err)
+	}
+
+	if _, err := io.Copy(part, file); err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("copy upload file: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("close upload body: %w", err)
+	}
+
+	u := c.endpointURL(endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), body)
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("create Taiga upload request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", c.authorization())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("upload attachment: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if !isSuccess(resp.StatusCode) {
+		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
+	}
+
+	result := any(nil)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, MAX_JSON_RESPONSE_BYTES))
+	if err := decoder.Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return map[string]any{}, responseMeta(resp), nil
+		}
+		return nil, ResponseMeta{}, fmt.Errorf("decode Taiga response: %w", err)
+	}
+	return result, responseMeta(resp), nil
 }
 
 func sameOrigin(a, b *url.URL) bool {

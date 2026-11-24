@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1215,6 +1216,29 @@ func formatDownload(result taiga.DownloadResult) string {
 
 	if result.ContentType != "" {
 		fmt.Fprintf(&b, "- **Tipo**: %s\n", result.ContentType)
+	}
+
+	return b.String()
+}
+
+func formatUpload(path string, size int64, data any) string {
+	b := strings.Builder{}
+	b.WriteString("Anexo enviado com sucesso ✅\n\n")
+	fmt.Fprintf(&b, "- **Arquivo**: `%s`\n", filepath.Base(path))
+	fmt.Fprintf(&b, "- **Tamanho**: %s\n", formatFileSize(size))
+
+	obj, ok := data.(map[string]any)
+	if !ok {
+		return b.String()
+	}
+
+	if id := displayValue(obj["id"]); id != "" {
+		fmt.Fprintf(&b, "- **Anexo**: %s\n", id)
+	}
+
+	name := redactText(displayValue(obj["name"]))
+	if name != "" {
+		fmt.Fprintf(&b, "- **Nome no Taiga**: %s\n", name)
 	}
 
 	return b.String()

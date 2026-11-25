@@ -1734,8 +1734,8 @@ func (s *Server) uploadAttachment(ctx context.Context, endpoint string, input At
 	}
 
 	fields := map[string]string{
-		"object_id":  strconv.Itoa(input.ObjectID),
-		"project_id": strconv.Itoa(input.ProjectID),
+		"object_id": strconv.Itoa(input.ObjectID),
+		"project":   strconv.Itoa(input.ProjectID),
 	}
 
 	description := strings.TrimSpace(input.Description)

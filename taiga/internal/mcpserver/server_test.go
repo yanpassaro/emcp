@@ -216,7 +216,7 @@ func TestUploadAccepted(t *testing.T) {
 		t.Errorf("path = %q", gotPath)
 	}
 
-	for _, want := range []string{`name="object_id"`, `name="project_id"`, `filename="nota.txt"`, "combinado por escrito"} {
+	for _, want := range []string{`name="object_id"`, `name="project"`, `filename="nota.txt"`, "combinado por escrito"} {
 		if !strings.Contains(gotBody, want) {
 			t.Errorf("multipart sem %q:\n%s", want, gotBody)
 		}
@@ -224,6 +224,10 @@ func TestUploadAccepted(t *testing.T) {
 
 	if !strings.Contains(resultText(t, res), "Anexo enviado") {
 		t.Errorf("output sem confirmação")
+	}
+
+	if strings.Contains(gotBody, `name="project_id"`) {
+		t.Errorf("multipart enviou project_id; o Taiga espera o campo 'project':\n%s", gotBody)
 	}
 }
 

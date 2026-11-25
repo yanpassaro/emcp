@@ -13,7 +13,7 @@ redação de PII ativada por padrão) em vez de JSON cru.
 | `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug), de um card/issue/task (`entity=card|issue|task` + id/ref) ou do seu usuário (`entity=info`: id, username, nome, e-mail, papéis e os projetos em que você participa) |
 | `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`) |
 | `taiga_search` | Busca cards, issues e tasks por assunto/ref |
-| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` dentro de `TAIGA_UPLOAD_DIRS` |
+| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco |
 
 ## Política de escrita
 
@@ -22,30 +22,51 @@ qualquer chamada ao Taiga. Conteúdo bloqueado retorna erro e nada é enviado.
 
 Comentários e descrições de anexo são recusados quando contêm:
 
-- termos ofensivos: lista embutida ampla em pt-BR/en, comparada por palavra inteira e
-  insensível a acento e maiúsculas (`otário` = `otario`); pode ser estendida por
-  `TAIGA_BANNED_WORDS` (vírgula) ou por uma wordlist em `TAIGA_BANNED_WORDS_FILE`
-  (um termo por linha ou separado por vírgula, linhas com `#` são ignoradas). Se o
-  arquivo configurado não puder ser lido, comentários e uploads ficam bloqueados;
+- termos ofensivos: lista embutida ampla em pt-BR/en, comparada por palavra
+  inteira. A comparação ignora acento e caixa (`otário` = `otario`), leetspeak
+  comum (`0`→`o`, `3`→`e`, `4`→`a`, `@`→`a`) e letras repetidas
+  (`meeerda` = `merda`). Pode ser estendida por `TAIGA_BANNED_WORDS` (uma palavra
+  por termo, separadas por vírgula);
 - credenciais em texto (`senha=…`, `token: …`, `api_key=…`), chave privada,
   tokens de GitLab/GitHub/Slack/AWS, URL de banco com usuário e senha;
 - PII: e-mail, CPF, CNPJ, telefone;
 - IP interno ou hostname interno (`*.internal`, `*.local`, `*.lan`, `*.corp`);
 - mais de 4000 caracteres.
 
-Uploads são recusados quando:
+Uploads aceitam qualquer arquivo legível, exceto tipos opacos que o filtro não
+consegue inspecionar. São recusados quando:
 
-- o arquivo resolvido (symlinks incluídos) está fora de `TAIGA_UPLOAD_DIRS`;
-- o caminho ou o nome é oculto (começa com `.`);
-- a extensão ou o nome é de segredo/banco: `.env`, `.pem`, `.key`, `.pfx`,
-  `.p12`, `.kdbx`, `.ovpn`, `.sql`, `.dump`, `.bak`, `.sqlite`, `.db`, `.ppk`,
-  `id_rsa`, `credentials`, `secrets`, `kubeconfig`, `.npmrc`, `.netrc`, `.pgpass`;
-- é um arquivo compactado (`.zip`, `.7z`, `.rar`, `.tar`, `.gz`, …), a menos que
-  `TAIGA_UPLOAD_ALLOW_ARCHIVES` esteja ligado;
+- o nome é de segredo/configuração: `.env*`, `id_rsa`, `id_dsa`, `id_ecdsa`,
+  `id_ed25519`, `credentials`, `secrets`, `secret`, `kubeconfig`, `.npmrc`,
+  `.netrc`, `.pgpass`;
+- a extensão é de segredo, credencial ou banco: chaves e certificados (`.pem`,
+  `.key`, `.crt`, `.cert`, `.cer`, `.der`, `.csr`, `.p7b`, `.p7c`, `.p8`,
+  `.pfx`, `.p12`, `.jks`, `.keystore`, `.bks`, `.ppk`), chaves PGP (`.gpg`,
+  `.pgp`, `.asc`), cofres (`.kdb`, `.kdbx`, `.psafe3`, `.1pux`, `.1pif`),
+  configuração com segredo (`.env`, `.envrc`, `.npmrc`, `.netrc`, `.pgpass`,
+  `.ovpn`, `.kubeconfig`), estado de IaC (`.tfstate`, `.tfvars`), dumps de banco
+  (`.sql`, `.dump`, `.dmp`, `.bak`, `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.mdb`,
+  `.accdb`, `.dbf`, `.mdf`, `.ldf`, `.frm`, `.ibd`, `.myd`, `.myi`, `.bson`,
+  `.rdb`, `.aof`, `.ldb`, `.sst`) e capturas de tráfego (`.har`, `.pcap`,
+  `.pcapng`, `.ldif`);
+- é compactado, imagem de disco ou pacote: `.zip`, `.zipx`, `.z01`, `.rar`,
+  `.r00`, `.7z`, `.tar`, `.gz`, `.tgz`, `.bz2`, `.tbz`, `.tbz2`, `.xz`,
+  `.txz`, `.lz`, `.lz4`, `.lzma`, `.zst`, `.zstd`, `.br`, `.z`, `.ace`,
+  `.arj`, `.lzh`, `.lha`, `.cab`, `.sit`, `.sitx`, `.cpio`, `.iso`, `.img`,
+  `.dmg`, `.vhd`, `.vhdx`, `.vmdk`, `.ova`, `.jar`, `.war`, `.ear`, `.apk`,
+  `.aab`, `.ipa`, `.deb`, `.rpm`, `.msi`, `.msp`, `.pkg`, `.appimage`,
+  `.snap` — não há como abrir e conferir o conteúdo, então vale como fail-closed;
 - excede `TAIGA_MAX_UPLOAD_MB` ou está vazio;
 - os primeiros 64 KB contêm algum dos padrões de credencial/PII acima.
 
-Upload fica **desativado** enquanto `TAIGA_UPLOAD_DIRS` não for configurado.
+Executáveis e documentos comuns (`.exe`, `.pdf`, `.png`, `.xlsx`, `.docx`, …)
+continuam liberados: barrar todo binário opaco tiraria o uso real do dia a dia. O
+alvo são os formatos de "dump" — compactados, imagens de disco e pacotes — que
+costumam carregar um volume grande de conteúdo sem passar pelo filtro.
+
+Não há restrição de diretório: qualquer caminho acessível ao processo é aceito,
+mas o arquivo é resolvido com `EvalSymlinks` antes da checagem de nome e
+conteúdo — um symlink chamado `nota.txt` apontando para `id_rsa` é recusado.
 
 ## Build
 
@@ -68,11 +89,8 @@ go build -o bin/taiga-mcp.exe ./cmd/taiga-mcp
 | `TAIGA_HTTP_TIMEOUT_SECONDS` | `60` | Timeout do cliente HTTP |
 | `TAIGA_MAX_DOWNLOAD_MB` | `100` | Limite de tamanho para baixar anexos |
 | `TAIGA_DOWNLOAD_DIR` | `~/.local/share/mcp/taiga/downloads` | Onde os anexos são salvos |
-| `TAIGA_UPLOAD_DIRS` | – | Diretórios (separados por vírgula) de onde o upload é permitido |
 | `TAIGA_MAX_UPLOAD_MB` | `10` | Limite de tamanho para enviar anexos |
-| `TAIGA_UPLOAD_ALLOW_ARCHIVES` | desligado | `true`, `1`, `yes` ou `on` libera arquivos compactados |
-| `TAIGA_BANNED_WORDS` | – | Termos extras (separados por vírgula) bloqueados em comentários |
-| `TAIGA_BANNED_WORDS_FILE` | – | Arquivo com termos extras (um por linha ou separado por vírgula); se não puder ser lido, a escrita fica bloqueada |
+| `TAIGA_BANNED_WORDS` | – | Palavras extras (uma por termo, separadas por vírgula) bloqueadas em comentários |
 | `TAIGA_REDACT` | habilitado | Use `false`, `0`, `no` ou `off` para desativar a redação de PII |
 
 Para autenticar, é usado o primeiro disponível entre: `TAIGA_TOKEN`,

@@ -32,7 +32,7 @@ var defaultBannedWords = []string{
 	"mentiroso", "mentirosa", "covarde", "covardes", "palhaco", "palhaca", "palhacos",
 	"merda", "merdas", "merdinha", "merdice", "merdao", "bosta", "bostas",
 	"bostinha", "cagada", "cagadas", "cagar", "caguei", "porra", "porras",
-	"porrinha", "porrao", "caralho", "caralhos", "caralhada", "cacete", "cacetes",
+	"porrinha", "caralho", "caralhos", "caralhada", "cacete", "cacetes",
 	"caceta", "foda", "foder", "fodeu", "fudido", "fudida", "krl", "kct", "kceta",
 	"pqp", "pnc", "tnc", "vtnc", "fdp", "vsf", "vsfd", "arrombado", "arrombada",
 	"arrombados", "arrombadas", "puta", "putas", "puto", "putos", "putaria",
@@ -62,6 +62,10 @@ var accentFolder = strings.NewReplacer(
 	"ç", "c", "ñ", "n",
 )
 
+var leetFolder = strings.NewReplacer(
+	"0", "o", "3", "e", "4", "a", "@", "a",
+)
+
 var secretPatterns = []struct {
 	label   string
 	pattern *regexp.Regexp
@@ -83,12 +87,17 @@ var secretPatterns = []struct {
 }
 
 var blockedExtensions = []string{
-	".env", ".pem", ".key", ".pfx", ".p12", ".kdbx", ".ovpn",
-	".sql", ".dump", ".bak", ".sqlite", ".db", ".ppk",
-}
-
-var blockedArchives = []string{
-	".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz",
+	".env", ".envrc", ".npmrc", ".netrc", ".pgpass",
+	".pem", ".key", ".crt", ".cert", ".cer", ".der", ".csr", ".p7b", ".p7c",
+	".p8", ".pfx", ".p12", ".jks", ".keystore", ".bks", ".ppk",
+	".gpg", ".pgp", ".asc",
+	".kdb", ".kdbx", ".psafe3", ".1pux", ".1pif",
+	".ovpn", ".kubeconfig",
+	".tfstate", ".tfvars",
+	".sql", ".dump", ".dmp", ".bak", ".sqlite", ".sqlite3", ".db", ".db3",
+	".mdb", ".accdb", ".dbf", ".mdf", ".ldf", ".frm", ".ibd", ".myd", ".myi",
+	".bson", ".rdb", ".aof", ".ldb", ".sst",
+	".har", ".pcap", ".pcapng", ".ldif",
 }
 
 var blockedNames = []string{
@@ -96,20 +105,23 @@ var blockedNames = []string{
 	"secrets", "secret", "kubeconfig", ".npmrc", ".netrc", ".pgpass",
 }
 
+var blockedArchives = []string{
+	".zip", ".zipx", ".z01", ".rar", ".r00", ".7z", ".tar", ".gz", ".tgz",
+	".bz2", ".tbz", ".tbz2", ".xz", ".txz", ".lz", ".lz4", ".lzma",
+	".zst", ".zstd", ".br", ".z", ".ace", ".arj", ".lzh", ".lha", ".cab",
+	".sit", ".sitx", ".cpio", ".iso", ".img", ".dmg", ".vhd", ".vhdx",
+	".vmdk", ".ova", ".jar", ".war", ".ear", ".apk", ".aab", ".ipa",
+	".deb", ".rpm", ".msi", ".msp", ".pkg", ".appimage", ".snap",
+}
+
 type Options struct {
-	BannedWords     []string
-	BannedWordsFile string
-	UploadDirs      []string
-	MaxUploadBytes  int64
-	AllowArchives   bool
+	BannedWords    []string
+	MaxUploadBytes int64
 }
 
 type Guard struct {
 	bannedWords    []string
-	uploadDirs     []string
 	maxUploadBytes int64
-	allowArchives  bool
-	loadErr        error
 }
 
 func New(opts Options) *Guard {
@@ -118,60 +130,13 @@ func New(opts Options) *Guard {
 		maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES
 	}
 
-	words := append(slices.Clone(defaultBannedWords), opts.BannedWords...)
-	loadErr := error(nil)
-
-	path := strings.TrimSpace(opts.BannedWordsFile)
-	if path != "" {
-		extra, err := readWordsFile(path)
-		if err != nil {
-			loadErr = fmt.Errorf("lista de termos bloqueados indisponível: %w", err)
-		}
-		if loadErr == nil {
-			words = append(words, extra...)
-		}
-	}
-
 	return &Guard{
-		bannedWords:    normalizeWords(words),
-		uploadDirs:     opts.UploadDirs,
+		bannedWords:    normalizeWords(append(slices.Clone(defaultBannedWords), opts.BannedWords...)),
 		maxUploadBytes: maxUploadBytes,
-		allowArchives:  opts.AllowArchives,
-		loadErr:        loadErr,
 	}
-}
-
-func readWordsFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	words := []string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		entry := strings.TrimSpace(line)
-		if entry == "" {
-			continue
-		}
-		if strings.HasPrefix(entry, "#") {
-			continue
-		}
-		for _, part := range strings.Split(entry, ",") {
-			word := strings.TrimSpace(part)
-			if word == "" {
-				continue
-			}
-			words = append(words, word)
-		}
-	}
-
-	return words, nil
 }
 
 func (g *Guard) Comment(text string) error {
-	if g.loadErr != nil {
-		return g.loadErr
-	}
 	value := strings.TrimSpace(text)
 	if value == "" {
 		return errors.New("texto vazio")
@@ -195,14 +160,6 @@ func (g *Guard) Comment(text string) error {
 }
 
 func (g *Guard) Attachment(path, description string) (string, int64, error) {
-	if g.loadErr != nil {
-		return "", 0, g.loadErr
-	}
-
-	if len(g.uploadDirs) == 0 {
-		return "", 0, errors.New("upload desativado: configure TAIGA_UPLOAD_DIRS com os diretórios permitidos")
-	}
-
 	description = strings.TrimSpace(description)
 	if description != "" {
 		if err := g.Comment(description); err != nil {
@@ -260,44 +217,11 @@ func (g *Guard) uploadTarget(path string) (string, int64, error) {
 		return "", 0, fmt.Errorf("arquivo maior que o limite de %d bytes", g.maxUploadBytes)
 	}
 
-	if err := g.checkAllowed(resolved); err != nil {
-		return "", 0, err
-	}
-
-	if err := checkName(filepath.Base(resolved), g.allowArchives); err != nil {
+	if err := checkName(filepath.Base(resolved)); err != nil {
 		return "", 0, err
 	}
 
 	return resolved, info.Size(), nil
-}
-
-func (g *Guard) checkAllowed(resolved string) error {
-	lowerPath := strings.ToLower(resolved)
-	for _, dir := range g.uploadDirs {
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			continue
-		}
-
-		base, err := filepath.EvalSymlinks(abs)
-		if err != nil {
-			continue
-		}
-
-		prefix := strings.ToLower(filepath.Clean(base)) + string(filepath.Separator)
-		if !strings.HasPrefix(lowerPath, prefix) {
-			continue
-		}
-
-		rel := resolved[len(base)+1:]
-		if hiddenSegment(rel) {
-			return fmt.Errorf("arquivo ou diretório oculto não pode ser enviado: %s", rel)
-		}
-
-		return nil
-	}
-
-	return fmt.Errorf("arquivo fora dos diretórios permitidos (TAIGA_UPLOAD_DIRS): %s", resolved)
 }
 
 func scanFile(path string) ([]string, error) {
@@ -340,7 +264,7 @@ func bannedReason(banned []string, text string) string {
 }
 
 func tokens(text string) []string {
-	folded := accentFolder.Replace(strings.ToLower(text))
+	folded := foldText(text)
 	parts := strings.FieldsFunc(folded, func(r rune) bool { return !unicode.IsLetter(r) })
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -349,10 +273,29 @@ func tokens(text string) []string {
 	return out
 }
 
+func foldText(text string) string {
+	value := accentFolder.Replace(strings.ToLower(text))
+	value = leetFolder.Replace(value)
+	return collapseRepeats(value)
+}
+
+func collapseRepeats(value string) string {
+	b := strings.Builder{}
+	previous := rune(0)
+	for _, r := range value {
+		if r == previous {
+			continue
+		}
+		b.WriteRune(r)
+		previous = r
+	}
+	return b.String()
+}
+
 func normalizeWords(words []string) []string {
 	out := make([]string, 0, len(words))
 	for _, word := range words {
-		value := strings.TrimSpace(accentFolder.Replace(strings.ToLower(word)))
+		value := strings.TrimSpace(foldText(word))
 		if value == "" {
 			continue
 		}
@@ -364,22 +307,7 @@ func normalizeWords(words []string) []string {
 	return out
 }
 
-func hiddenSegment(rel string) bool {
-	parts := strings.FieldsFunc(rel, func(r rune) bool {
-		if r == '/' {
-			return true
-		}
-		return r == '\\'
-	})
-	for _, part := range parts {
-		if strings.HasPrefix(part, ".") {
-			return true
-		}
-	}
-	return false
-}
-
-func checkName(name string, allowArchives bool) error {
+func checkName(name string) error {
 	lower := strings.ToLower(name)
 
 	if slices.Contains(blockedNames, lower) {
@@ -396,10 +324,8 @@ func checkName(name string, allowArchives bool) error {
 		return fmt.Errorf("extensão bloqueada: %s", name)
 	}
 
-	if !allowArchives {
-		if slices.Contains(blockedArchives, ext) {
-			return fmt.Errorf("arquivos compactados são bloqueados: %s", name)
-		}
+	if slices.Contains(blockedArchives, ext) {
+		return fmt.Errorf("tipo de arquivo bloqueado (compactado ou imagem): %s", name)
 	}
 
 	return nil

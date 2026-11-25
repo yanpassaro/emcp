@@ -60,11 +60,8 @@ func New(client *taiga.Client) *Server {
 	}
 
 	guard := policy.New(policy.Options{
-		BannedWords:     envList("TAIGA_BANNED_WORDS"),
-		BannedWordsFile: strings.TrimSpace(os.Getenv("TAIGA_BANNED_WORDS_FILE")),
-		UploadDirs:      envList("TAIGA_UPLOAD_DIRS"),
-		MaxUploadBytes:  int64(envInt("TAIGA_MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * MEGABYTE,
-		AllowArchives:   envTrue("TAIGA_UPLOAD_ALLOW_ARCHIVES"),
+		BannedWords:    envList("TAIGA_BANNED_WORDS"),
+		MaxUploadBytes: int64(envInt("TAIGA_MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * MEGABYTE,
 	})
 
 	return &Server{client: client, guard: guard}
@@ -98,15 +95,6 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
-func envTrue(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
-	case "true", "1", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *Server) Register(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_list",
@@ -127,7 +115,7 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.search)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_attachment",
-		Description: "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (a file inside TAIGA_UPLOAD_DIRS, screened for credentials, PII and blocked extensions).",
+		Description: "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (any readable file; secret-like names/extensions, archives and disk images are rejected).",
 	}, s.attachment)
 }
 
@@ -685,7 +673,7 @@ type AttachmentInput struct {
 	AttachmentID int    `json:"attachment_id,omitempty" jsonschema:"Attachment ID (required for action=download)"`
 	Filename     string `json:"filename,omitempty" jsonschema:"Output filename (defaults to Taiga's name)"`
 	Path         string `json:"path,omitempty" jsonschema:"Output path (defaults to the configured directory)"`
-	SourcePath   string `json:"source_path,omitempty" jsonschema:"Local file to upload (required for action=upload); must resolve inside TAIGA_UPLOAD_DIRS"`
+	SourcePath   string `json:"source_path,omitempty" jsonschema:"Local file to upload (required for action=upload); any readable file, but secret-like names/extensions and archives/images are rejected"`
 	Description  string `json:"description,omitempty" jsonschema:"Attachment description (action=upload; screened like a comment)"`
 }
 

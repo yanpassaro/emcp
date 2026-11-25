@@ -26,9 +26,13 @@ func TestCommentBlocksContent(t *testing.T) {
 		{name: "palavrao", text: "essa merda de deploy", want: "termo impróprio"},
 		{name: "palavrao com acento", text: "que otário", want: "termo impróprio"},
 		{name: "palavrao sem acento", text: "que otario", want: "termo impróprio"},
+		{name: "palavrao em caixa alta", text: "QUE MERDA", want: "termo impróprio"},
 		{name: "palavrao plural", text: "eles são uns idiotas", want: "termo impróprio"},
 		{name: "ofensa homofobica", text: "esse viado", want: "termo impróprio"},
 		{name: "sigla", text: "vtnc, mano", want: "termo impróprio"},
+		{name: "leet numero", text: "que m3rda de deploy", want: "termo impróprio"},
+		{name: "leet arroba", text: "seu b@baca", want: "termo impróprio"},
+		{name: "letras repetidas", text: "que meeerda", want: "termo impróprio"},
 		{name: "chave privada", text: "-----BEGIN RSA PRIVATE KEY-----", want: "chave privada"},
 	}
 
@@ -53,6 +57,25 @@ func TestCommentBlocksContent(t *testing.T) {
 	}
 }
 
+func TestCommentAcceptsLegitText(t *testing.T) {
+	guard := New(Options{})
+
+	texts := []string{
+		"o processo do computador está estável",
+		"a classe tem acesso ao sucesso do deploy",
+		"precisamos revisar a conta e a contabilidade",
+		"o assunto do card é análise de custo",
+		"segue o resumo da reunião de alinhamento",
+		"o servidor fica no porão do prédio",
+	}
+
+	for _, text := range texts {
+		if err := guard.Comment(text); err != nil {
+			t.Fatalf("falso positivo em %q: %v", text, err)
+		}
+	}
+}
+
 func TestCommentBlocksLongText(t *testing.T) {
 	guard := New(Options{})
 	text := strings.Repeat("a", MAX_COMMENT_CHARS+1)
@@ -63,89 +86,39 @@ func TestCommentBlocksLongText(t *testing.T) {
 }
 
 func TestCommentAcceptsCustomBannedWords(t *testing.T) {
-	guard := New(Options{BannedWords: []string{"cliente-chato"}})
+	guard := New(Options{BannedWords: []string{"concorrente"}})
 
-	err := guard.Comment("o cliente-chato reclamou de novo")
+	err := guard.Comment("o concorrente reclamou de novo")
 	if err == nil {
 		t.Fatal("esperava bloqueio da palavra configurada")
 	}
 }
 
-func TestCommentLoadsWordsFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "palavras.txt")
-	content := "# termos internos\nconcorrente-x, processo-antigo\n\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	guard := New(Options{BannedWordsFile: path})
-
-	for _, text := range []string{"falar mal do concorrente-x", "voltar com o processo-antigo"} {
-		if err := guard.Comment(text); err == nil {
-			t.Fatalf("esperava bloqueio de %q", text)
-		}
-	}
-
-	if err := guard.Comment("segue o ajuste combinado"); err != nil {
-		t.Fatalf("esperava aprovação, veio: %v", err)
-	}
-}
-
-func TestCommentFailsClosedWithoutWordsFile(t *testing.T) {
-	guard := New(Options{BannedWordsFile: filepath.Join(t.TempDir(), "nao-existe.txt")})
-
-	err := guard.Comment("segue o ajuste combinado")
-	if err == nil {
-		t.Fatal("esperava falha fechada")
-	}
-
-	if !strings.Contains(err.Error(), "indisponível") {
-		t.Fatalf("erro = %q", err.Error())
-	}
-}
-
-func TestAttachmentRequiresUploadDirs(t *testing.T) {
-	dir := t.TempDir()
-	file := writeFile(t, dir, "nota.txt", "combinado por escrito")
-
-	_, _, err := New(Options{}).Attachment(file, "")
-	if err == nil {
-		t.Fatal("esperava upload desativado")
-	}
-
-	if !strings.Contains(err.Error(), "TAIGA_UPLOAD_DIRS") {
-		t.Fatalf("erro = %q", err.Error())
-	}
-}
-
-func TestAttachmentRejectsOutsideDirs(t *testing.T) {
-	allowed := t.TempDir()
-	outside := t.TempDir()
-	file := writeFile(t, outside, "nota.txt", "combinado por escrito")
-
-	_, _, err := New(Options{UploadDirs: []string{allowed}}).Attachment(file, "")
-	if err == nil {
-		t.Fatal("esperava bloqueio fora dos diretórios")
-	}
-
-	if !strings.Contains(err.Error(), "TAIGA_UPLOAD_DIRS") {
-		t.Fatalf("erro = %q", err.Error())
-	}
-}
-
 func TestAttachmentRejectsBlockedNames(t *testing.T) {
 	dir := t.TempDir()
-	guard := New(Options{UploadDirs: []string{dir}})
+	guard := New(Options{})
 
 	tests := []struct {
 		name string
 		want string
 	}{
-		{name: ".env", want: "oculto"},
+		{name: ".env", want: "nome de arquivo bloqueado"},
+		{name: ".env.local", want: "nome de arquivo bloqueado"},
 		{name: "dump.sql", want: "extensão bloqueada"},
 		{name: "id_rsa", want: "nome de arquivo bloqueado"},
-		{name: "backup.zip", want: "arquivos compactados"},
+		{name: "cert.pem", want: "extensão bloqueada"},
+		{name: "prod.kubeconfig", want: "extensão bloqueada"},
+		{name: "terraform.tfstate", want: "extensão bloqueada"},
+		{name: "chave.asc", want: "extensão bloqueada"},
+		{name: "cofre.1pux", want: "extensão bloqueada"},
+		{name: "cache.rdb", want: "extensão bloqueada"},
+		{name: "captura.har", want: "extensão bloqueada"},
+		{name: "sessao.pcap", want: "extensão bloqueada"},
+		{name: "backup.zip", want: "compactado ou imagem"},
+		{name: "base.tar.gz", want: "compactado ou imagem"},
+		{name: "app.apk", want: "compactado ou imagem"},
+		{name: "disco.iso", want: "compactado ou imagem"},
+		{name: "dump.vmdk", want: "compactado ou imagem"},
 	}
 
 	for _, test := range tests {
@@ -164,21 +137,11 @@ func TestAttachmentRejectsBlockedNames(t *testing.T) {
 	}
 }
 
-func TestAttachmentAllowsArchivesWhenConfigured(t *testing.T) {
-	dir := t.TempDir()
-	file := writeFile(t, dir, "backup.zip", "conteudo")
-
-	_, _, err := New(Options{UploadDirs: []string{dir}, AllowArchives: true}).Attachment(file, "")
-	if err != nil {
-		t.Fatalf("esperava aprovação, veio: %v", err)
-	}
-}
-
 func TestAttachmentRejectsSensitiveContent(t *testing.T) {
 	dir := t.TempDir()
 	file := writeFile(t, dir, "config.txt", "senha=SuperSecreta123\n")
 
-	_, _, err := New(Options{UploadDirs: []string{dir}}).Attachment(file, "")
+	_, _, err := New(Options{}).Attachment(file, "")
 	if err == nil {
 		t.Fatal("esperava bloqueio por conteúdo")
 	}
@@ -188,48 +151,56 @@ func TestAttachmentRejectsSensitiveContent(t *testing.T) {
 	}
 }
 
-func TestAttachmentRejectsHiddenFiles(t *testing.T) {
-	dir := t.TempDir()
-	file := writeFile(t, dir, ".rascunho.txt", "combinado")
-
-	_, _, err := New(Options{UploadDirs: []string{dir}}).Attachment(file, "")
-	if err == nil {
-		t.Fatal("esperava bloqueio de arquivo oculto")
-	}
-
-	if !strings.Contains(err.Error(), "oculto") {
-		t.Fatalf("erro = %q", err.Error())
-	}
-}
-
-func TestAttachmentAcceptsRegularFile(t *testing.T) {
-	dir := t.TempDir()
-	file := writeFile(t, dir, "nota.txt", "combinado por escrito")
-
-	resolved, size, err := New(Options{UploadDirs: []string{dir}}).Attachment(file, "resumo do alinhamento")
-	if err != nil {
-		t.Fatalf("esperava aprovação, veio: %v", err)
-	}
-
-	if size <= 0 {
-		t.Fatalf("tamanho = %d", size)
-	}
-
-	if filepath.Base(resolved) != "nota.txt" {
-		t.Fatalf("resolved = %q", resolved)
-	}
-}
-
 func TestAttachmentRejectsSensitiveDescription(t *testing.T) {
 	dir := t.TempDir()
 	file := writeFile(t, dir, "nota.txt", "combinado por escrito")
 
-	_, _, err := New(Options{UploadDirs: []string{dir}}).Attachment(file, "senha=SuperSecreta123")
+	_, _, err := New(Options{}).Attachment(file, "senha=SuperSecreta123")
 	if err == nil {
 		t.Fatal("esperava bloqueio da descrição")
 	}
 
 	if !strings.Contains(err.Error(), "descrição do anexo") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+}
+
+func TestAttachmentAcceptsAnyReadableFile(t *testing.T) {
+	dir := t.TempDir()
+	guard := New(Options{})
+
+	names := []string{"nota.txt", "foto.png", "planilha.xlsx", "relatorio.pdf", ".rascunho.md"}
+
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			file := writeFile(t, dir, name, "conteudo")
+
+			resolved, size, err := guard.Attachment(file, "resumo do alinhamento")
+			if err != nil {
+				t.Fatalf("esperava aprovação, veio: %v", err)
+			}
+
+			if size <= 0 {
+				t.Fatalf("tamanho = %d", size)
+			}
+
+			if filepath.Base(resolved) != name {
+				t.Fatalf("resolved = %q", resolved)
+			}
+		})
+	}
+}
+
+func TestAttachmentRejectsEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	file := writeFile(t, dir, "vazio.txt", "")
+
+	_, _, err := New(Options{}).Attachment(file, "")
+	if err == nil {
+		t.Fatal("esperava bloqueio de arquivo vazio")
+	}
+
+	if !strings.Contains(err.Error(), "vazio") {
 		t.Fatalf("erro = %q", err.Error())
 	}
 }

@@ -152,15 +152,12 @@ func TestCommentRejected(t *testing.T) {
 	}
 }
 
-func TestUploadRejectedOutsideDirs(t *testing.T) {
-	allowed := t.TempDir()
-	outside := t.TempDir()
-	file := filepath.Join(outside, "nota.txt")
+func TestUploadRejectedDangerousName(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "dump.sql")
 	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	t.Setenv("TAIGA_UPLOAD_DIRS", allowed)
 
 	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
 	if err != nil {
@@ -174,19 +171,17 @@ func TestUploadRejectedOutsideDirs(t *testing.T) {
 		t.Fatal("esperava recusa do upload")
 	}
 
-	if !strings.Contains(err.Error(), "TAIGA_UPLOAD_DIRS") {
+	if !strings.Contains(err.Error(), "extensão bloqueada") {
 		t.Fatalf("erro = %q", err.Error())
 	}
 }
 
 func TestUploadAccepted(t *testing.T) {
-	allowed := t.TempDir()
-	file := filepath.Join(allowed, "nota.txt")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "nota.txt")
 	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	t.Setenv("TAIGA_UPLOAD_DIRS", allowed)
 
 	gotPath := ""
 	gotBody := ""

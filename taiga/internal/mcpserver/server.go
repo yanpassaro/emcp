@@ -35,8 +35,9 @@ const (
 )
 
 type Server struct {
-	client *taiga.Client
-	guard  *policy.Guard
+	client   *taiga.Client
+	guard    *policy.Guard
+	allowAct bool
 }
 
 var redactEnabled = true
@@ -64,7 +65,7 @@ func New(client *taiga.Client) *Server {
 		MaxUploadBytes: int64(envInt("TAIGA_MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * MEGABYTE,
 	})
 
-	return &Server{client: client, guard: guard}
+	return &Server{client: client, guard: guard, allowAct: envEnabled("TAIGA_ALLOW_ACT")}
 }
 
 func envList(name string) []string {
@@ -95,6 +96,15 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
+func envEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) Register(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_list",
@@ -104,10 +114,12 @@ func (s *Server) Register(server *mcp.Server) {
 		Name:        "taiga_get",
 		Description: "Get a project (by project_id or slug), a card/issue/task (by id or ref+project_id), or your own user (entity=info: id, username, name, email, roles and the projects you are a member of). Set 'entity' (project|card|issue|task|info).",
 	}, s.get)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "taiga_change",
-		Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. The comment is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
-	}, s.change)
+	if s.allowAct {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "taiga_change",
+			Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. The comment is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
+		}, s.change)
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_search",
@@ -115,8 +127,15 @@ func (s *Server) Register(server *mcp.Server) {
 	}, s.search)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_attachment",
-		Description: "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (any readable file; secret-like names/extensions, archives and disk images are rejected).",
+		Description: attachmentDescription(s.allowAct),
 	}, s.attachment)
+}
+
+func attachmentDescription(allowUpload bool) string {
+	if allowUpload {
+		return "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (any readable file; secret-like names/extensions, archives and disk images are rejected)."
+	}
+	return "List or download attachments of a card, issue or task. Set 'entity' and 'action' (list|download). 'list' requires object_id & project_id; 'download' requires attachment_id."
 }
 
 type ListActivityInput struct {
@@ -1400,6 +1419,10 @@ func assigneeSummary(obj map[string]any, ids []int) string {
 }
 
 func (s *Server) applyChange(ctx context.Context, kind, base string, input ChangeInput, idLabel string) (*mcp.CallToolResult, any, error) {
+	if !s.allowAct {
+		return nil, nil, errors.New("alterações desativadas: conceda TAIGA_ALLOW_ACT para liberar escritas")
+	}
+
 	if err := validateChange(input); err != nil {
 		return nil, nil, err
 	}
@@ -1720,6 +1743,10 @@ func (s *Server) downloadAttachment(ctx context.Context, endpoint string, input 
 }
 
 func (s *Server) uploadAttachment(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
+	if !s.allowAct {
+		return nil, nil, errors.New("upload desativado: conceda TAIGA_ALLOW_ACT para liberar escritas")
+	}
+
 	if err := positive("project_id", input.ProjectID); err != nil {
 		return nil, nil, err
 	}

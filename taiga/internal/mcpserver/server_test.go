@@ -73,6 +73,8 @@ func TestInfo(t *testing.T) {
 }
 
 func TestCommentPosted(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotBody := ""
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +123,8 @@ func TestCommentPosted(t *testing.T) {
 }
 
 func TestCommentRejected(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotMethod := ""
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +156,76 @@ func TestCommentRejected(t *testing.T) {
 	}
 }
 
+func TestWithoutAllowActRejectsChange(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "")
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	_, _, err = New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, Comment: "segue o ajuste combinado",
+	})
+	if err == nil {
+		t.Fatal("esperava recusa sem TAIGA_ALLOW_ACT")
+	}
+
+	if !strings.Contains(err.Error(), "TAIGA_ALLOW_ACT") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+}
+
+func TestWithoutAllowActRejectsUpload(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "nota.txt")
+	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TAIGA_ALLOW_ACT", "")
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = New(client).attachment(context.Background(), nil, AttachmentInput{
+		Entity: "card", Action: "upload", ObjectID: 1, ProjectID: 2, SourcePath: file,
+	})
+	if err == nil {
+		t.Fatal("esperava recusa sem TAIGA_ALLOW_ACT")
+	}
+
+	if !strings.Contains(err.Error(), "TAIGA_ALLOW_ACT") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+}
+
+func TestAllowActControlsDescriptions(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "1")
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	New(client).Register(server)
+
+	if got := attachmentDescription(false); strings.Contains(got, "upload") {
+		t.Fatalf("descrição sem escrita menciona upload: %q", got)
+	}
+
+	if got := attachmentDescription(true); !strings.Contains(got, "upload") {
+		t.Fatalf("descrição com escrita sem upload: %q", got)
+	}
+}
+
 func TestUploadRejectedDangerousName(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	dir := t.TempDir()
 	file := filepath.Join(dir, "dump.sql")
 	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
@@ -177,6 +250,8 @@ func TestUploadRejectedDangerousName(t *testing.T) {
 }
 
 func TestUploadAccepted(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	dir := t.TempDir()
 	file := filepath.Join(dir, "nota.txt")
 	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
@@ -232,6 +307,8 @@ func TestUploadAccepted(t *testing.T) {
 }
 
 func TestChangeStatusCard(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotMethod := ""
 	gotPath := ""
 	gotBody := ""
@@ -290,6 +367,8 @@ func TestChangeStatusCard(t *testing.T) {
 }
 
 func TestChangeStatusIssue(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotMethod := ""
 	gotPath := ""
 	gotBody := ""
@@ -349,6 +428,8 @@ func TestChangeStatusIssue(t *testing.T) {
 }
 
 func TestChangeTagsCard(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotMethod := ""
 	gotPath := ""
 	gotBody := ""
@@ -407,6 +488,8 @@ func TestChangeTagsCard(t *testing.T) {
 }
 
 func TestChangeAssignees(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotMethod := ""
 	gotPath := ""
 	gotBody := ""
@@ -465,6 +548,8 @@ func TestChangeAssignees(t *testing.T) {
 }
 
 func TestChangeAssignedTo(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	gotBody := ""
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -510,6 +595,8 @@ func TestChangeAssignedTo(t *testing.T) {
 }
 
 func TestChangeRequiresTarget(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
 	client, err := taiga.NewClient(taiga.Config{BaseURL: "https://taiga.example.test", Token: "token"})
 	if err != nil {
 		t.Fatal(err)

@@ -2,8 +2,9 @@
 
 Servidor Model Context Protocol para [Taiga](https://www.taiga.io). Lê e
 atualiza user stories (cards), issues, tasks, tags, comentários e anexos dos
-projetos visíveis ao token configurado. A saída é Markdown organizado (com
-redação de PII ativada por padrão) em vez de JSON cru.
+projetos visíveis ao token configurado — as escritas só são liberadas com
+`TAIGA_ALLOW_ACT`; sem ela o servidor é somente leitura. A saída é Markdown
+organizado (com redação de PII ativada por padrão) em vez de JSON cru.
 
 ## Tools
 
@@ -11,9 +12,26 @@ redação de PII ativada por padrão) em vez de JSON cru.
 |---|---|
 | `taiga_list` | Lista projetos, cards, issues, tasks ou atividade recente (`entity=project|card|issue|task|activity`) com filtros; `count_only` retorna só o total. Em `activity`, use `project_id` (opcional), `my=true` e `card_id`/`issue_id`/`task_id` para histórico de um item |
 | `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug), de um card/issue/task (`entity=card|issue|task` + id/ref) ou do seu usuário (`entity=info`: id, username, nome, e-mail, papéis e os projetos em que você participa) |
-| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`) |
+| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`). Só é registrada quando `TAIGA_ALLOW_ACT` está ligado |
 | `taiga_search` | Busca cards, issues e tasks por assunto/ref |
-| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco |
+| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco (indisponível sem `TAIGA_ALLOW_ACT`) |
+
+## Controle de ações
+
+Sem `TAIGA_ALLOW_ACT`, o servidor sobe somente leitura:
+
+- a tool `taiga_change` **não é registrada** — o modelo nem vê que ela existe;
+- `taiga_attachment action=upload` é recusado, e a descrição da tool passa a
+  anunciar apenas `list` e `download`;
+- `taiga_list`, `taiga_get`, `taiga_search` e o download de anexos continuam
+  normais.
+
+Com `TAIGA_ALLOW_ACT` ligado (`true`, `1`, `yes` ou `on`), alterações,
+comentários e upload ficam liberados.
+
+A checagem também roda dentro dos handlers, então mesmo uma chamada direta
+(fora da lista de tools) é recusada com
+`conceda TAIGA_ALLOW_ACT para liberar escritas`.
 
 ## Política de escrita
 
@@ -92,6 +110,7 @@ go build -o bin/taiga-mcp.exe ./cmd/taiga-mcp
 | `TAIGA_MAX_UPLOAD_MB` | `10` | Limite de tamanho para enviar anexos |
 | `TAIGA_BANNED_WORDS` | – | Palavras extras (uma por termo, separadas por vírgula) bloqueadas em comentários |
 | `TAIGA_REDACT` | habilitado | Use `false`, `0`, `no` ou `off` para desativar a redação de PII |
+| `TAIGA_ALLOW_ACT` | desligado | `true`, `1`, `yes` ou `on` libera escritas (alterações, comentários e upload); sem ela o servidor é somente leitura |
 
 Para autenticar, é usado o primeiro disponível entre: `TAIGA_TOKEN`,
 `TAIGA_REFRESH_TOKEN` ou `TAIGA_USERNAME` + `TAIGA_PASSWORD`.

@@ -275,6 +275,10 @@ func itemSummary(itemData any) (string, int, string) {
 }
 
 func historyAction(m map[string]any) string {
+	if commentDeleted(m) {
+		return "🗑️ apagou um comentário"
+	}
+
 	comment := strings.TrimSpace(displayValue(m["comment"]))
 	if comment != "" {
 		return fmt.Sprintf("💬 %s", comment)
@@ -288,11 +292,23 @@ func historyAction(m map[string]any) string {
 	return "📝 Modificado"
 }
 
+func commentDeleted(m map[string]any) bool {
+	return strings.TrimSpace(displayValue(m["delete_comment_date"])) != ""
+}
+
+func historyHidden(m map[string]any) bool {
+	return displayBool(m["is_hidden"])
+}
+
 func historyViews(entries []any) []historyEntryView {
 	views := make([]historyEntryView, 0, len(entries))
 	for _, it := range entries {
 		m, ok := it.(map[string]any)
 		if !ok {
+			continue
+		}
+
+		if historyHidden(m) {
 			continue
 		}
 
@@ -2025,6 +2041,14 @@ func (s *Server) loadComments(ctx context.Context, kind string, id int) []commen
 			continue
 		}
 
+		if historyHidden(m) {
+			continue
+		}
+
+		if commentDeleted(m) {
+			continue
+		}
+
 		text := strings.TrimSpace(displayValue(m["comment"]))
 		if text == "" {
 			continue
@@ -2080,6 +2104,10 @@ func (s *Server) loadLastAction(ctx context.Context, kind string, id int) string
 	userName := redactName(resolveCommentAuthor(latest))
 	if userName == "" {
 		userName = DASH
+	}
+
+	if commentDeleted(latest) {
+		return fmt.Sprintf("🗑️ %s apagou um comentário", userName)
 	}
 
 	comment := strings.TrimSpace(displayValue(latest["comment"]))

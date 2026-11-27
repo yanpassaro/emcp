@@ -327,6 +327,49 @@ func TestStripAttachmentRefs(t *testing.T) {
 	}
 }
 
+func TestCommentsHideDeleted(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/userstories/123":
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","project":7,"version":3,"tags":[]}`)
+		case "/api/v1/history/userstory/123":
+			writeText(t, w, `[
+				{"comment":"Comentario vivo","created_at":"2026-01-01T10:00:00Z","user":{"name":"Ana"}},
+				{"comment":"Comentario apagado","created_at":"2026-01-02T10:00:00Z","user":{"name":"Ana"},"delete_comment_date":"2026-01-03T10:00:00Z"},
+				{"comment":"Comentario oculto","created_at":"2026-01-02T11:00:00Z","user":{"name":"Ana"},"is_hidden":true}
+			]`)
+		default:
+			writeText(t, w, `[]`)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	res, _, err := New(client).get(context.Background(), nil, GetInput{Entity: "card", ID: &cardID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+
+	if !strings.Contains(text, "Comentario vivo") {
+		t.Errorf("output sem o comentário ativo:\n%s", text)
+	}
+
+	for _, hidden := range []string{"Comentario apagado", "Comentario oculto"} {
+		if strings.Contains(text, hidden) {
+			t.Errorf("output exibiu %q:\n%s", hidden, text)
+		}
+	}
+}
+
 func TestChangeStatusCard(t *testing.T) {
 	t.Setenv("TAIGA_ALLOW_ACT", "true")
 

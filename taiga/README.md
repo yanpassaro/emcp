@@ -70,6 +70,11 @@ O markdown de referência de anexo (`![nome](url#_taiga-refresh=…)`) é ignora
 pelo filtro de conteúdo: sem isso, uma URL de mídia em host interno barraria o
 próprio comentário que a referencia. O resto do texto é filtrado normalmente.
 
+Comentários apagados não aparecem na listagem (`taiga_get`): o Taiga mantém a
+entrada no histórico com `delete_comment_date` preenchido, e o servidor ignora
+essas entradas — assim como as marcadas com `is_hidden`. Na lista de atividade, o
+item vira `🗑️ Fulano apagou um comentário`.
+
 ## Política de escrita
 
 Comentários e uploads passam por um filtro no servidor (não no prompt) antes de

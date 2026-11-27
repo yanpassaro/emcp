@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	DEFAULT_PROJECT_ACTIVES = 5
 	MAX_PROJECT_ACTIVES     = 20
 	DEFAULT_MAX_UPLOAD_MB   = 10
+	MAX_COMMENT_IMAGES      = 10
 	MAX_PAGE_SIZE           = 1000
 	CARD                    = "card"
 	ISSUE                   = "issue"
@@ -117,7 +119,7 @@ func (s *Server) Register(server *mcp.Server) {
 	if s.allowAct {
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "taiga_change",
-			Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. The comment is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
+			Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment, optionally with images. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags', 'comment' and/or 'comment_images'. Each image (png, jpg, jpeg, gif, webp) is uploaded as a comment attachment and embedded in the comment markdown. The comment text is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
 		}, s.change)
 	}
 
@@ -682,6 +684,7 @@ type ChangeInput struct {
 	AddTags       []string `json:"add_tags,omitempty" jsonschema:"Tags to add (use the project tags spelling)"`
 	RemoveTags    []string `json:"remove_tags,omitempty" jsonschema:"Tags to remove"`
 	Comment       string   `json:"comment,omitempty" jsonschema:"Comment to post on the item (screened for profanity, credentials, PII and internal hosts before posting)"`
+	CommentImages []string `json:"comment_images,omitempty" jsonschema:"Local image files (png, jpg, jpeg, gif, webp) uploaded as comment attachments and embedded in the comment"`
 }
 
 type AttachmentInput struct {
@@ -1331,6 +1334,10 @@ func validateChange(input ChangeInput) error {
 		return nil
 	}
 
+	if len(input.CommentImages) != 0 {
+		return nil
+	}
+
 	if input.StatusID != nil {
 		return nil
 	}
@@ -1351,7 +1358,7 @@ func validateChange(input ChangeInput) error {
 		return nil
 	}
 
-	return errors.New("informe status_id, assigned_to, assigned_users, add_tags, remove_tags ou comment")
+	return errors.New("informe status_id, assigned_to, assigned_users, add_tags, remove_tags, comment ou comment_images")
 }
 
 func tagsRequested(input ChangeInput) bool {
@@ -1418,6 +1425,96 @@ func assigneeSummary(obj map[string]any, ids []int) string {
 	return strings.Join(parts, ", ")
 }
 
+func (s *Server) commentImages(ctx context.Context, base string, itemID, projectID int, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+
+	if len(paths) > MAX_COMMENT_IMAGES {
+		return nil, fmt.Errorf("comment_images aceita no máximo %d imagens", MAX_COMMENT_IMAGES)
+	}
+
+	if projectID <= 0 {
+		return nil, errors.New("não foi possível identificar o projeto do item para anexar as imagens")
+	}
+
+	markdown := []string{}
+	for _, path := range paths {
+		resolved, _, err := s.guard.Attachment(path, "")
+		if err != nil {
+			return nil, err
+		}
+
+		name := filepath.Base(resolved)
+		if !isCommentImage(name) {
+			return nil, fmt.Errorf("comment_images aceita apenas png, jpg, jpeg, gif ou webp: %s", name)
+		}
+
+		fields := map[string]string{
+			"object_id":    strconv.Itoa(itemID),
+			"project":      strconv.Itoa(projectID),
+			"from_comment": "true",
+		}
+
+		data, _, err := s.client.Upload(ctx, fmt.Sprintf("%s/attachments", base), fields, "attached_file", resolved)
+		if err != nil {
+			return nil, fmt.Errorf("envio da imagem %s recusado: %w", name, err)
+		}
+
+		attachment, ok := data.(map[string]any)
+		if !ok {
+			return nil, errors.New("resposta do Taiga para a imagem não é um objeto JSON")
+		}
+
+		url := withoutFragment(displayValue(attachment["url"]))
+		if url == "" {
+			return nil, fmt.Errorf("o anexo retornado para %s não contém url", name)
+		}
+
+		attachmentID := displayInt(attachment["id"])
+		if attachmentID <= 0 {
+			return nil, fmt.Errorf("o anexo retornado para %s não contém id", name)
+		}
+
+		markdown = append(markdown, fmt.Sprintf(
+			"![%s](%s#_taiga-refresh=%s:%d)",
+			displayValue(attachment["name"]),
+			url,
+			commentAttachmentToken(base),
+			attachmentID,
+		))
+	}
+
+	return markdown, nil
+}
+
+func isCommentImage(name string) bool {
+	switch fileExt(name) {
+	case "png", "jpg", "jpeg", "gif", "webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func commentAttachmentToken(base string) string {
+	switch base {
+	case "/userstories":
+		return "us"
+	case "/issues":
+		return "issue"
+	default:
+		return "task"
+	}
+}
+
+func withoutFragment(value string) string {
+	if i := strings.Index(value, "#"); i >= 0 {
+		return value[:i]
+	}
+	return value
+}
+
 func (s *Server) applyChange(ctx context.Context, kind, base string, input ChangeInput, idLabel string) (*mcp.CallToolResult, any, error) {
 	if !s.allowAct {
 		return nil, nil, errors.New("alterações desativadas: conceda TAIGA_ALLOW_ACT para liberar escritas")
@@ -1480,6 +1577,18 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 		if err := s.guard.Comment(comment); err != nil {
 			return nil, nil, err
 		}
+	}
+
+	images, err := s.commentImages(ctx, base, item.id, extractIntField(beforeObj, "project"), input.CommentImages)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(images) != 0 {
+		comment = strings.TrimSpace(strings.Join(append([]string{comment}, images...), "\n\n"))
+	}
+
+	if comment != "" {
 		body["comment"] = comment
 	}
 
@@ -1524,6 +1633,10 @@ func (s *Server) applyChange(ctx context.Context, kind, base string, input Chang
 		b.WriteString("\n### 💬 Comentário publicado\n\n")
 		b.WriteString(comment)
 		b.WriteString("\n")
+	}
+
+	if len(images) != 0 {
+		fmt.Fprintf(&b, "- **Imagens anexadas:** %d\n", len(images))
 	}
 
 	fmt.Fprintf(&b, "- **%s:** %d\n", idLabel, item.id)

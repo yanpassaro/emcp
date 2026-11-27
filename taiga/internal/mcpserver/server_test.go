@@ -306,6 +306,114 @@ func TestUploadAccepted(t *testing.T) {
 	}
 }
 
+func TestCommentWithImage(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
+	dir := t.TempDir()
+	image := filepath.Join(dir, "evidencia.png")
+	if err := os.WriteFile(image, []byte("png-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	gotUpload := ""
+	gotPatch := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/userstories/attachments":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			gotUpload = string(body)
+			writeText(t, w, `{"id":9,"name":"evidencia.png","url":"/media/evidencia.png#frag"}`)
+		case "/api/v1/userstories/123":
+			if r.Method == http.MethodPatch {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				gotPatch = string(body)
+				writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":4}`)
+				return
+			}
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3,"project":7}`)
+		default:
+			t.Errorf("caminho inesperado: %s", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	res, _, err := New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID,
+		Comment:       "Segue a evidência.",
+		CommentImages: []string{image},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{`name="from_comment"`, `name="project"`, `name="object_id"`, `filename="evidencia.png"`} {
+		if !strings.Contains(gotUpload, want) {
+			t.Errorf("upload sem %q:\n%s", want, gotUpload)
+		}
+	}
+
+	if strings.Contains(gotUpload, `name="project_id"`) {
+		t.Errorf("upload enviou project_id; o Taiga espera 'project'")
+	}
+
+	wantComment := `"comment":"Segue a evidência.\n\n![evidencia.png](/media/evidencia.png#_taiga-refresh=us:9)"`
+	if !strings.Contains(gotPatch, wantComment) {
+		t.Errorf("PATCH body = %q, esperava %q", gotPatch, wantComment)
+	}
+
+	if !strings.Contains(resultText(t, res), "Imagens anexadas") {
+		t.Errorf("output sem contagem de imagens")
+	}
+}
+
+func TestCommentImageRejectsNonImage(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "nota.txt")
+	if err := os.WriteFile(file, []byte("combinado"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3,"project":7}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	_, _, err = New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, CommentImages: []string{file},
+	})
+	if err == nil {
+		t.Fatal("esperava recusa de arquivo que não é imagem")
+	}
+
+	if !strings.Contains(err.Error(), "apenas png") {
+		t.Fatalf("erro = %q", err.Error())
+	}
+}
+
 func TestChangeStatusCard(t *testing.T) {
 	t.Setenv("TAIGA_ALLOW_ACT", "true")
 

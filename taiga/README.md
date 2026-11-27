@@ -12,9 +12,9 @@ organizado (com redação de PII ativada por padrão) em vez de JSON cru.
 |---|---|
 | `taiga_list` | Lista projetos, cards, issues, tasks ou atividade recente (`entity=project|card|issue|task|activity`) com filtros; `count_only` retorna só o total. Em `activity`, use `project_id` (opcional), `my=true` e `card_id`/`issue_id`/`task_id` para histórico de um item |
 | `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug), de um card/issue/task (`entity=card|issue|task` + id/ref) ou do seu usuário (`entity=info`: id, username, nome, e-mail, papéis e os projetos em que você participa) |
-| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário, opcionalmente com imagens (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`, `comment_images`). Só é registrada quando `TAIGA_ALLOW_ACT` está ligado |
+| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`). Só é registrada quando `TAIGA_ALLOW_ACT` está ligado |
 | `taiga_search` | Busca cards, issues e tasks por assunto/ref |
-| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco (indisponível sem `TAIGA_ALLOW_ACT`) |
+| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco, e retorna a `URL` e o `Markdown` pronto (use `from_comment=true` para embutir no comentário) — indisponível sem `TAIGA_ALLOW_ACT` |
 
 ## Controle de ações
 
@@ -35,32 +35,40 @@ A checagem também roda dentro dos handlers, então mesmo uma chamada direta
 
 ## Comentário com imagem
 
-`taiga_change` aceita `comment_images` com caminhos locais de imagens. Cada uma
-passa pelo mesmo filtro do upload (nome, extensão, tamanho e scan de conteúdo),
-é enviada como anexo com `from_comment=true` e injetada no comentário como
-Markdown:
+O Taiga faz isso em dois passos. A `url` que a API devolve já vem pronta para o
+comentário: ela termina em `#_taiga-refresh=<tipo>:<id>`, o marcador que o front
+(`wysiwyg.service` → `refreshAttachmentURLFromMarkdown`) troca pela URL assinada
+atual na hora de renderizar. É por isso que não se deve mexer nessa URL.
+
+**1. subir a imagem como anexo de comentário:**
 
 ```json
 {
-  "entity": "card", "item_id": 8542, "project_id": 174,
-  "comment": "Segue a evidência do bug.",
-  "comment_images": ["task/523/evidence/evidence-1.png"]
+  "entity": "card", "action": "upload",
+  "object_id": 8542, "project_id": 174,
+  "source_path": "task/523/evidence/evidence-1.png",
+  "from_comment": true
 }
 ```
 
-O resultado publicado fica `Segue a evidência do bug.` seguido de
-`![evidence-1.png](/media/...png#_taiga-refresh=us:9)`.
+A resposta traz a `URL` e o `Markdown para o comentário`, por exemplo:
 
-O sufixo `#_taiga-refresh=<tipo>:<id>` é o mesmo marcador que o editor do Taiga
-grava (`wysiwyg.service` → `refreshAttachmentURLFromMarkdown`): ao renderizar, o
-front troca o marcador pela URL assinada atual do anexo (`us`, `issue` ou `task`
-+ id do anexo). Sem ele, a URL assinada expira e o navegador mostra só o texto
-alternativo — que é o `[image.png]` que aparece no comentário.
+```
+![evidence-1.png](/media/.../evidence-1.png?token=...#_taiga-refresh=userstory:9)
+```
 
-Só `png`, `jpg`, `jpeg`, `gif` e `webp` são aceitos, até 10 imagens por chamada.
+**2. publicar o comentário com esse markdown:**
 
-O filtro de conteúdo roda sobre o texto que você escreveu, não sobre a URL
-injetada pelo servidor — senão a própria URL do anexo barraria o comentário.
+```json
+{
+  "entity": "card", "item_id": 8542,
+  "comment": "Segue a evidência do bug. ![evidence-1.png](/media/.../evidence-1.png?token=...#_taiga-refresh=userstory:9)"
+}
+```
+
+O markdown de referência de anexo (`![nome](url#_taiga-refresh=…)`) é ignorado
+pelo filtro de conteúdo: sem isso, uma URL de mídia em host interno barraria o
+próprio comentário que a referencia. O resto do texto é filtrado normalmente.
 
 ## Política de escrita
 

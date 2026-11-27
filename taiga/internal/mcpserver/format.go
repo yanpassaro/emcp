@@ -1236,9 +1236,17 @@ func formatUpload(path string, size int64, data any) string {
 		fmt.Fprintf(&b, "- **Anexo**: %s\n", id)
 	}
 
-	name := redactText(displayValue(obj["name"]))
+	name := displayValue(obj["name"])
 	if name != "" {
-		fmt.Fprintf(&b, "- **Nome no Taiga**: %s\n", name)
+		fmt.Fprintf(&b, "- **Nome no Taiga**: %s\n", redactText(name))
+	}
+
+	url := displayValue(obj["url"])
+	if url != "" {
+		fmt.Fprintf(&b, "- **URL**: %s\n", url)
+		if name != "" {
+			fmt.Fprintf(&b, "- **Markdown para o comentário**: `![%s](%s)`\n", name, url)
+		}
 	}
 
 	return b.String()

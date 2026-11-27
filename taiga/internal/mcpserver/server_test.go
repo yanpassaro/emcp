@@ -271,7 +271,7 @@ func TestUploadAccepted(t *testing.T) {
 
 		gotPath = r.URL.Path
 		gotBody = string(body)
-		writeText(t, w, `{"id":9,"name":"nota.txt"}`)
+		writeText(t, w, `{"id":9,"name":"nota.txt","url":"/media/nota.txt?token=abc#_taiga-refresh=userstory:9"}`)
 	}))
 	defer backend.Close()
 
@@ -281,7 +281,7 @@ func TestUploadAccepted(t *testing.T) {
 	}
 
 	res, _, err := New(client).attachment(context.Background(), nil, AttachmentInput{
-		Entity: "card", Action: "upload", ObjectID: 1, ProjectID: 2, SourcePath: file, Description: "resumo do alinhamento",
+		Entity: "card", Action: "upload", ObjectID: 1, ProjectID: 2, SourcePath: file, Description: "resumo do alinhamento", FromComment: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -304,113 +304,26 @@ func TestUploadAccepted(t *testing.T) {
 	if strings.Contains(gotBody, `name="project_id"`) {
 		t.Errorf("multipart enviou project_id; o Taiga espera o campo 'project':\n%s", gotBody)
 	}
-}
 
-func TestCommentWithImage(t *testing.T) {
-	t.Setenv("TAIGA_ALLOW_ACT", "true")
-
-	dir := t.TempDir()
-	image := filepath.Join(dir, "evidencia.png")
-	if err := os.WriteFile(image, []byte("png-bytes"), 0o600); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(gotBody, `name="from_comment"`) {
+		t.Errorf("multipart sem from_comment:\n%s", gotBody)
 	}
 
-	gotUpload := ""
-	gotPatch := ""
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		switch r.URL.Path {
-		case "/api/v1/userstories/attachments":
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Error(err)
-			}
-			gotUpload = string(body)
-			writeText(t, w, `{"id":9,"name":"evidencia.png","url":"/media/evidencia.png#frag"}`)
-		case "/api/v1/userstories/123":
-			if r.Method == http.MethodPatch {
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Error(err)
-				}
-				gotPatch = string(body)
-				writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":4}`)
-				return
-			}
-			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3,"project":7}`)
-		default:
-			t.Errorf("caminho inesperado: %s", r.URL.Path)
-		}
-	}))
-	defer backend.Close()
-
-	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cardID := 123
-	res, _, err := New(client).change(context.Background(), nil, ChangeInput{
-		Entity: "card", ItemID: &cardID,
-		Comment:       "Segue a evidência.",
-		CommentImages: []string{image},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, want := range []string{`name="from_comment"`, `name="project"`, `name="object_id"`, `filename="evidencia.png"`} {
-		if !strings.Contains(gotUpload, want) {
-			t.Errorf("upload sem %q:\n%s", want, gotUpload)
-		}
-	}
-
-	if strings.Contains(gotUpload, `name="project_id"`) {
-		t.Errorf("upload enviou project_id; o Taiga espera 'project'")
-	}
-
-	wantComment := `"comment":"Segue a evidência.\n\n![evidencia.png](/media/evidencia.png#_taiga-refresh=us:9)"`
-	if !strings.Contains(gotPatch, wantComment) {
-		t.Errorf("PATCH body = %q, esperava %q", gotPatch, wantComment)
-	}
-
-	if !strings.Contains(resultText(t, res), "Imagens anexadas") {
-		t.Errorf("output sem contagem de imagens")
+	output := resultText(t, res)
+	if !strings.Contains(output, "![nota.txt](/media/nota.txt?token=abc#_taiga-refresh=userstory:9)") {
+		t.Errorf("output sem markdown pronto:\n%s", output)
 	}
 }
 
-func TestCommentImageRejectsNonImage(t *testing.T) {
-	t.Setenv("TAIGA_ALLOW_ACT", "true")
+func TestStripAttachmentRefs(t *testing.T) {
+	ref := "![evidencia.png](http://192.168.0.10/media/e.png?token=abc#_taiga-refresh=userstory:9)"
 
-	dir := t.TempDir()
-	file := filepath.Join(dir, "nota.txt")
-	if err := os.WriteFile(file, []byte("combinado"), 0o600); err != nil {
-		t.Fatal(err)
+	if got := stripAttachmentRefs(ref); got != "[anexo]" {
+		t.Fatalf("stripAttachmentRefs = %q", got)
 	}
 
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3,"project":7}`)
-	}))
-	defer backend.Close()
-
-	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cardID := 123
-	_, _, err = New(client).change(context.Background(), nil, ChangeInput{
-		Entity: "card", ItemID: &cardID, CommentImages: []string{file},
-	})
-	if err == nil {
-		t.Fatal("esperava recusa de arquivo que não é imagem")
-	}
-
-	if !strings.Contains(err.Error(), "apenas png") {
-		t.Fatalf("erro = %q", err.Error())
+	if got := stripAttachmentRefs("texto com 192.168.0.10 solto"); !strings.Contains(got, "192.168.0.10") {
+		t.Fatalf("o strip não deve mascarar IP fora de referência de anexo: %q", got)
 	}
 }
 

@@ -100,7 +100,7 @@ consegue inspecionar. São recusados quando:
   `.pgp`, `.asc`), cofres (`.kdb`, `.kdbx`, `.psafe3`, `.1pux`, `.1pif`),
   configuração com segredo (`.env`, `.envrc`, `.npmrc`, `.netrc`, `.pgpass`,
   `.ovpn`, `.kubeconfig`), estado de IaC (`.tfstate`, `.tfvars`), dumps de banco
-  (`.sql`, `.dump`, `.dmp`, `.bak`, `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.mdb`,
+  (`.dump`, `.dmp`, `.bak`, `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.mdb`,
   `.accdb`, `.dbf`, `.mdf`, `.ldf`, `.frm`, `.ibd`, `.myd`, `.myi`, `.bson`,
   `.rdb`, `.aof`, `.ldb`, `.sst`) e capturas de tráfego (`.har`, `.pcap`,
   `.pcapng`, `.ldif`);

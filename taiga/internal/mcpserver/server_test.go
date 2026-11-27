@@ -227,7 +227,7 @@ func TestUploadRejectedDangerousName(t *testing.T) {
 	t.Setenv("TAIGA_ALLOW_ACT", "true")
 
 	dir := t.TempDir()
-	file := filepath.Join(dir, "dump.sql")
+	file := filepath.Join(dir, "dump.dmp")
 	if err := os.WriteFile(file, []byte("combinado por escrito"), 0o600); err != nil {
 		t.Fatal(err)
 	}

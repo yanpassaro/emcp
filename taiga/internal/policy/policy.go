@@ -94,7 +94,7 @@ var blockedExtensions = []string{
 	".kdb", ".kdbx", ".psafe3", ".1pux", ".1pif",
 	".ovpn", ".kubeconfig",
 	".tfstate", ".tfvars",
-	".sql", ".dump", ".dmp", ".bak", ".sqlite", ".sqlite3", ".db", ".db3",
+	".dump", ".dmp", ".bak", ".sqlite", ".sqlite3", ".db", ".db3",
 	".mdb", ".accdb", ".dbf", ".mdf", ".ldf", ".frm", ".ibd", ".myd", ".myi",
 	".bson", ".rdb", ".aof", ".ldb", ".sst",
 	".har", ".pcap", ".pcapng", ".ldif",

@@ -104,7 +104,7 @@ func TestAttachmentRejectsBlockedNames(t *testing.T) {
 	}{
 		{name: ".env", want: "nome de arquivo bloqueado"},
 		{name: ".env.local", want: "nome de arquivo bloqueado"},
-		{name: "dump.sql", want: "extensão bloqueada"},
+		{name: "dump.dmp", want: "extensão bloqueada"},
 		{name: "id_rsa", want: "nome de arquivo bloqueado"},
 		{name: "cert.pem", want: "extensão bloqueada"},
 		{name: "prod.kubeconfig", want: "extensão bloqueada"},

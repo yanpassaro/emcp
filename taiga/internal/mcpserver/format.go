@@ -611,6 +611,7 @@ func formatObject(data any) string {
 }
 
 type commentView struct {
+	id     int
 	author string
 	date   string
 	text   string
@@ -707,12 +708,15 @@ func commentHeader(c commentView) string {
 		who = DASH
 	}
 
-	when := ""
+	parts := []string{who}
 	if c.date != "" {
-		when = fmt.Sprintf(" · %s", c.date)
+		parts = append(parts, c.date)
+	}
+	if c.id != 0 {
+		parts = append(parts, fmt.Sprintf("id %d", c.id))
 	}
 
-	return fmt.Sprintf("%s%s", who, when)
+	return strings.Join(parts, " · ")
 }
 
 func writeComments(b *strings.Builder, comments []commentView) {

@@ -10,11 +10,11 @@ organizado (com redação de PII ativada por padrão) em vez de JSON cru.
 
 | Tool | Descrição |
 |---|---|
-| `taiga_list` | Lista projetos, cards, issues, tasks ou atividade recente (`entity=project|card|issue|task|activity`) com filtros; `count_only` retorna só o total. Em `activity`, use `project_id` (opcional), `my=true` e `card_id`/`issue_id`/`task_id` para histórico de um item |
+| `taiga_list` | Lista projetos, cards, issues, tasks ou atividade recente (`entity=project|card|issue|task|activity`) com filtros; `count_only` retorna só o total. Em `activity`, use `project_id` (opcional), `my=true`, `card_id`/`issue_id`/`task_id` para histórico de um item e `since`/`until` (RFC3339 ou `AAAA-MM-DD`) para limitar por data de modificação |
 | `taiga_get` | Detalhe de um projeto (`entity=project` + id/slug), de um card/issue/task (`entity=card|issue|task` + id/ref) ou do seu usuário (`entity=info`: id, username, nome, e-mail, papéis e os projetos em que você participa) |
-| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`). Só é registrada quando `TAIGA_ALLOW_ACT` está ligado |
-| `taiga_search` | Busca cards, issues e tasks por assunto/ref |
-| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`) ou envia (`action=upload`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco, e retorna a `URL` e o `Markdown` pronto (use `from_comment=true` para embutir no comentário) — indisponível sem `TAIGA_ALLOW_ACT` |
+| `taiga_change` | Altera status, responsáveis e/ou tags de um card, issue ou task, e/ou publica um comentário; com `action=edit_comment`/`delete_comment`/`undelete_comment` + `comment_id` gerencia um comentário existente (`entity` + `item_id` ou `ref`+`project_id`; `status_id`, `assigned_to`/`assigned_users`, `add_tags`, `remove_tags`, `comment`). Só é registrada quando `TAIGA_ALLOW_ACT` está ligado |
+| `taiga_search` | Busca em escopos selecionáveis por `scope` (padrão `cards,issues,tasks,projects`): cards/issues/tasks por assunto/ref, projetos por nome/slug/descrição, `wiki` (exige `project_id`, via `/search`) e `comments` (exige `card_id`/`issue_id`/`task_id`) |
+| `taiga_attachment` | Lista (`action=list`), baixa (`action=download`), envia (`action=upload`) ou remove (`action=delete`) anexos de um item; o upload exige `source_path` e aceita arquivos legíveis, exceto nomes/extensões de segredo, compactados e imagens de disco, e retorna a `URL` e o `Markdown` pronto (use `from_comment=true` para embutir no comentário) — indisponível sem `TAIGA_ALLOW_ACT` |
 
 ## Controle de ações
 
@@ -74,6 +74,17 @@ Comentários apagados não aparecem na listagem (`taiga_get`): o Taiga mantém a
 entrada no histórico com `delete_comment_date` preenchido, e o servidor ignora
 essas entradas — assim como as marcadas com `is_hidden`. Na lista de atividade, o
 item vira `🗑️ Fulano apagou um comentário`.
+
+Cada comentário listado traz o `id` (entrada do histórico), que é o `comment_id`
+usado por `taiga_change` com `action=edit_comment`, `delete_comment` ou
+`undelete_comment`:
+
+```json
+{"entity":"card","item_id":8542,"action":"delete_comment","comment_id":77}
+{"entity":"card","item_id":8542,"action":"edit_comment","comment_id":77,"comment":"texto novo"}
+```
+
+Editar passa pelo mesmo filtro de conteúdo de um comentário novo.
 
 ## Política de escrita
 

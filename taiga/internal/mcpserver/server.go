@@ -25,6 +25,8 @@ const (
 	MAX_ACTIVITY_LIMIT      = 100
 	DEFAULT_SEARCH_LIMIT    = 10
 	MAX_SEARCH_LIMIT        = 30
+	SEARCH_FETCH_LIMIT      = 100
+	SNIPPET_CHARS           = 90
 	DEFAULT_PROJECT_ACTIVES = 5
 	MAX_PROJECT_ACTIVES     = 20
 	DEFAULT_MAX_UPLOAD_MB   = 10
@@ -109,7 +111,7 @@ func envEnabled(name string) bool {
 func (s *Server) Register(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_list",
-		Description: "List projects, cards (user stories), issues, tasks or recent activity. Set 'entity' (project|card|issue|task|activity). For project: filters member/page/page_size. For card/issue/task: require 'project_id' and use only the filters valid for that entity. For activity: project_id optional (0 = all), use my=true for your own, and card_id/issue_id/task_id to see one item's history. Set 'count_only' to get just the total count.",
+		Description: "List projects, cards (user stories), issues, tasks or recent activity. Set 'entity' (project|card|issue|task|activity). For project: filters member/page/page_size. For card/issue/task: require 'project_id' and use only the filters valid for that entity. For activity: project_id optional (0 = all), use my=true for your own, card_id/issue_id/task_id to see one item's history, and since/until (RFC3339 or YYYY-MM-DD) to bound by modification date. Set 'count_only' to get just the total count.",
 	}, s.listItems)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_get",
@@ -118,13 +120,13 @@ func (s *Server) Register(server *mcp.Server) {
 	if s.allowAct {
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "taiga_change",
-			Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. The comment text is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
+			Description: "Change a card's, issue's or task's status, assignees and/or tags, and/or post a comment. Set 'entity', 'item_id' or 'ref'+'project_id', plus 'status_id' (see taiga_get), 'assigned_to'/'assigned_users', 'add_tags'/'remove_tags' and/or 'comment'. Use action=edit_comment/delete_comment/undelete_comment with comment_id (from taiga_get) to manage an existing comment. The comment text is screened before posting: profanity, credentials, PII and internal IPs/hostnames are rejected.",
 		}, s.change)
 	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_search",
-		Description: "Search cards, issues and tasks by subject text (case-insensitive) or ref number. project_id scopes the search; limit caps results (default 10, max 30).",
+		Description: "Search cards, issues, tasks (subject/ref), projects (name/slug/description), wiki pages and comments. 'scope' is a comma-separated list (default cards,issues,tasks,projects). scope=wiki requires project_id; scope=comments requires card_id, issue_id or task_id. project_id scopes the cards/issues/tasks search; limit caps results (default 10, max 30).",
 	}, s.search)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "taiga_attachment",
@@ -134,18 +136,69 @@ func (s *Server) Register(server *mcp.Server) {
 
 func attachmentDescription(allowUpload bool) string {
 	if allowUpload {
-		return "List, download or upload attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload). 'list' requires object_id & project_id; 'download' requires attachment_id; 'upload' requires object_id, project_id and source_path (any readable file; secret-like names/extensions, archives and disk images are rejected)."
+		return "List, download, upload or delete attachments of a card, issue or task. Set 'entity' and 'action' (list|download|upload|delete). 'list' requires object_id & project_id; 'download' and 'delete' require attachment_id; 'upload' requires object_id, project_id and source_path (any readable file; secret-like names/extensions, archives and disk images are rejected)."
 	}
 	return "List or download attachments of a card, issue or task. Set 'entity' and 'action' (list|download). 'list' requires object_id & project_id; 'download' requires attachment_id."
 }
 
 type ListActivityInput struct {
-	ProjectID *int  `json:"project_id,omitempty" jsonschema:"Filter by project"`
-	My        *bool `json:"my,omitempty" jsonschema:"Only your activities"`
-	Limit     *int  `json:"limit,omitempty" jsonschema:"Max items (max 100, default 20)"`
-	CardID    *int  `json:"card_id,omitempty" jsonschema:"Card ID; show only its activities"`
-	IssueID   *int  `json:"issue_id,omitempty" jsonschema:"Issue ID; show only its activities"`
-	TaskID    *int  `json:"task_id,omitempty" jsonschema:"Task ID; show only its activities"`
+	ProjectID *int   `json:"project_id,omitempty" jsonschema:"Filter by project"`
+	My        *bool  `json:"my,omitempty" jsonschema:"Only your activities"`
+	Limit     *int   `json:"limit,omitempty" jsonschema:"Max items (max 100, default 20)"`
+	CardID    *int   `json:"card_id,omitempty" jsonschema:"Card ID; show only its activities"`
+	IssueID   *int   `json:"issue_id,omitempty" jsonschema:"Issue ID; show only its activities"`
+	TaskID    *int   `json:"task_id,omitempty" jsonschema:"Task ID; show only its activities"`
+	Since     string `json:"since,omitempty" jsonschema:"Only entries modified at/after this moment (RFC3339 or YYYY-MM-DD)"`
+	Until     string `json:"until,omitempty" jsonschema:"Only entries modified at/before this moment (RFC3339 or YYYY-MM-DD)"`
+}
+
+func parseBound(value string, endOfDay bool) (time.Time, error) {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return time.Time{}, nil
+	}
+
+	parsed, err := time.Parse(time.RFC3339, text)
+	if err == nil {
+		return parsed, nil
+	}
+
+	day, err := time.Parse("2006-01-02", text)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("data inválida %q (use RFC3339 ou AAAA-MM-DD)", value)
+	}
+
+	if endOfDay {
+		return day.Add(24 * time.Hour), nil
+	}
+
+	return day, nil
+}
+
+func filterActivity(items []activityItem, since, until time.Time) []activityItem {
+	out := make([]activityItem, 0, len(items))
+	for _, item := range items {
+		moment := parseActivityTime(item.modified)
+		if moment.IsZero() {
+			out = append(out, item)
+			continue
+		}
+
+		if !since.IsZero() {
+			if moment.Before(since) {
+				continue
+			}
+		}
+
+		if !until.IsZero() {
+			if moment.After(until) {
+				continue
+			}
+		}
+
+		out = append(out, item)
+	}
+	return out
 }
 
 type activityItem struct {
@@ -200,6 +253,24 @@ func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mc
 	limit := activityLimit(input)
 	projectID := activityProjectID(input)
 
+	since, err := parseBound(input.Since, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	until, err := parseBound(input.Until, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fetch := limit
+	if !since.IsZero() {
+		fetch = MAX_ACTIVITY_LIMIT
+	}
+	if !until.IsZero() {
+		fetch = MAX_ACTIVITY_LIMIT
+	}
+
 	myID := 0
 	if input.My != nil {
 		if *input.My {
@@ -209,7 +280,7 @@ func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mc
 
 	query := url.Values{
 		"page":      []string{"1"},
-		"page_size": []string{strconv.Itoa(limit)},
+		"page_size": []string{strconv.Itoa(fetch)},
 	}
 
 	if projectID > 0 {
@@ -223,6 +294,7 @@ func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mc
 	if err == nil {
 		items := activityItemsFromTimeline(raw)
 		if len(items) > 0 {
+			items = filterActivity(items, since, until)
 			sort.Slice(items, func(i, j int) bool { return items[i].modified > items[j].modified })
 			if len(items) > limit {
 				items = items[:limit]
@@ -232,8 +304,9 @@ func (s *Server) listActivity(ctx context.Context, input ListActivityInput) (*mc
 	}
 
 	items := []activityItem{}
-	items = append(items, s.fetchRecentItems(ctx, "/userstories", CARD, projectID, myID, limit)...)
-	items = append(items, s.fetchRecentItems(ctx, "/issues", ISSUE, projectID, myID, limit)...)
+	items = append(items, s.fetchRecentItems(ctx, "/userstories", CARD, projectID, myID, fetch)...)
+	items = append(items, s.fetchRecentItems(ctx, "/issues", ISSUE, projectID, myID, fetch)...)
+	items = filterActivity(items, since, until)
 	sort.Slice(items, func(i, j int) bool { return items[i].modified > items[j].modified })
 	if len(items) > limit {
 		items = items[:limit]
@@ -690,6 +763,8 @@ type ListItemsInput struct {
 
 type ChangeInput struct {
 	Entity        string   `json:"entity" jsonschema:"Object type: card, issue or task"`
+	Action        string   `json:"action,omitempty" jsonschema:"Action: 'change' (default), 'edit_comment', 'delete_comment' or 'undelete_comment'"`
+	CommentID     *int     `json:"comment_id,omitempty" jsonschema:"History entry id of the comment (required for comment actions; see taiga_get)"`
 	ItemID        *int     `json:"item_id,omitempty" jsonschema:"Item ID"`
 	Ref           *int     `json:"ref,omitempty" jsonschema:"Item ref number"`
 	ProjectID     *int     `json:"project_id,omitempty" jsonschema:"Project ID (required when using ref)"`
@@ -703,7 +778,7 @@ type ChangeInput struct {
 
 type AttachmentInput struct {
 	Entity       string `json:"entity" jsonschema:"Object type: card, issue or task"`
-	Action       string `json:"action" jsonschema:"Action: 'list', 'download' or 'upload'"`
+	Action       string `json:"action" jsonschema:"Action: 'list', 'download', 'upload' or 'delete'"`
 	ObjectID     int    `json:"object_id,omitempty" jsonschema:"Item ID (required for action=list and action=upload)"`
 	ProjectID    int    `json:"project_id,omitempty" jsonschema:"Project ID (required for action=list and action=upload)"`
 	AttachmentID int    `json:"attachment_id,omitempty" jsonschema:"Attachment ID (required for action=download)"`
@@ -1559,7 +1634,77 @@ func (s *Server) change(ctx context.Context, _ *mcp.CallToolRequest, input Chang
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.applyChange(ctx, kind, base, input, idLabel)
+
+	action := strings.ToLower(strings.TrimSpace(input.Action))
+	switch action {
+	case "", "change":
+		return s.applyChange(ctx, kind, base, input, idLabel)
+	case "edit_comment", "delete_comment", "undelete_comment":
+		return s.commentAction(ctx, base, input, action)
+	default:
+		return nil, nil, fmt.Errorf("action inválida: %q (use 'change', 'edit_comment', 'delete_comment' ou 'undelete_comment')", action)
+	}
+}
+
+func historyPath(base string) string {
+	switch base {
+	case "/issues":
+		return "issue"
+	case "/tasks":
+		return "task"
+	default:
+		return "userstory"
+	}
+}
+
+func (s *Server) commentAction(ctx context.Context, base string, input ChangeInput, action string) (*mcp.CallToolResult, any, error) {
+	if !s.allowAct {
+		return nil, nil, errors.New("alterações desativadas: conceda TAIGA_ALLOW_ACT para liberar escritas")
+	}
+
+	if input.CommentID == nil {
+		return nil, nil, errors.New("comment_id é obrigatório para ações de comentário")
+	}
+
+	if err := positive("comment_id", *input.CommentID); err != nil {
+		return nil, nil, err
+	}
+
+	item, err := s.fetchItem(ctx, base, input.ItemID, input.Ref, input.ProjectID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	body := any(nil)
+	if action == "edit_comment" {
+		comment := strings.TrimSpace(input.Comment)
+		if comment == "" {
+			return nil, nil, errors.New("comment é obrigatório para editar um comentário")
+		}
+		if err := s.guard.Comment(stripAttachmentRefs(comment)); err != nil {
+			return nil, nil, err
+		}
+		body = map[string]any{"comment": comment}
+	}
+
+	query := url.Values{"id": []string{strconv.Itoa(*input.CommentID)}}
+	endpoint := fmt.Sprintf("/history/%s/%d/%s", historyPath(base), item.id, action)
+	if _, _, err := s.client.PostJSON(ctx, endpoint, query, body); err != nil {
+		return nil, nil, err
+	}
+
+	ref := displayInt(item.obj["ref"])
+	if ref == 0 {
+		ref = item.id
+	}
+
+	label := map[string]string{
+		"edit_comment":     "✏️ Comentário %d editado em %s #%d",
+		"delete_comment":   "🗑️ Comentário %d apagado em %s #%d",
+		"undelete_comment": "↩️ Comentário %d restaurado em %s #%d",
+	}
+
+	return textResult(fmt.Sprintf(label[action], *input.CommentID, historyPath(base), ref))
 }
 
 func itemBase(entity string) (base, kind, idLabel string, err error) {
@@ -1576,9 +1721,53 @@ func itemBase(entity string) (base, kind, idLabel string, err error) {
 }
 
 type SearchInput struct {
-	ProjectID *int   `json:"project_id,omitempty" jsonschema:"Project ID; omit to search all visible projects"`
-	Query     string `json:"query" jsonschema:"Subject text (case-insensitive) or ref number"`
+	ProjectID *int   `json:"project_id,omitempty" jsonschema:"Project ID; required for scope=wiki and to narrow cards/issues/tasks"`
+	Query     string `json:"query" jsonschema:"Text to search (case-insensitive) or ref number"`
 	Limit     *int   `json:"limit,omitempty" jsonschema:"Max results (default 10, max 30)"`
+	Scope     string `json:"scope,omitempty" jsonschema:"Comma-separated scopes: cards, issues, tasks, projects, wiki, comments (default cards,issues,tasks,projects)"`
+	CardID    *int   `json:"card_id,omitempty" jsonschema:"Card id whose comments are searched (scope=comments)"`
+	IssueID   *int   `json:"issue_id,omitempty" jsonschema:"Issue id whose comments are searched (scope=comments)"`
+	TaskID    *int   `json:"task_id,omitempty" jsonschema:"Task id whose comments are searched (scope=comments)"`
+}
+
+func searchScopes(value string) []string {
+	scopes := []string{}
+	for _, part := range strings.Split(strings.ToLower(value), ",") {
+		scope := strings.TrimSpace(part)
+		if scope == "" {
+			continue
+		}
+		scopes = append(scopes, scope)
+	}
+
+	if len(scopes) == 0 {
+		return []string{"cards", "issues", "tasks", "projects"}
+	}
+
+	return scopes
+}
+
+func scopeEnabled(scopes []string, name string) bool {
+	for _, scope := range scopes {
+		if scope == name {
+			return true
+		}
+	}
+	return false
+}
+
+func intOrDash(value int) string {
+	if value == 0 {
+		return DASH
+	}
+	return strconv.Itoa(value)
+}
+
+func textOrDash(value string) string {
+	if value == "" {
+		return DASH
+	}
+	return value
 }
 
 type searchRow struct {
@@ -1607,11 +1796,11 @@ func searchLimit(input SearchInput) int {
 	return *input.Limit
 }
 
-func searchBuckets() []struct{ kind, path string } {
-	return []struct{ kind, path string }{
-		{"Card", "/userstories"},
-		{"Issue", "/issues"},
-		{"Task", "/tasks"},
+func searchBuckets() []struct{ kind, scope, path string } {
+	return []struct{ kind, scope, path string }{
+		{"Card", "cards", "/userstories"},
+		{"Issue", "issues", "/issues"},
+		{"Task", "tasks", "/tasks"},
 	}
 }
 
@@ -1624,9 +1813,13 @@ func matchesQuery(m map[string]any, q string) bool {
 	return strings.EqualFold(refNo, q)
 }
 
-func (s *Server) searchBuckets(ctx context.Context, query url.Values, q string, limit int) []searchRow {
+func (s *Server) searchBuckets(ctx context.Context, query url.Values, q string, limit int, scopes []string) []searchRow {
 	rows := make([]searchRow, 0, limit)
 	for _, bucket := range searchBuckets() {
+		if !scopeEnabled(scopes, bucket.scope) {
+			continue
+		}
+
 		if len(rows) >= limit {
 			break
 		}
@@ -1682,7 +1875,7 @@ func formatSearchResult(rows []searchRow, rawQuery string, limit int) (*mcp.Call
 
 	for _, r := range rows {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n",
-			r.kind, strconv.Itoa(r.id), strconv.Itoa(r.ref), r.subject, r.status, r.assigned, r.project)
+			r.kind, intOrDash(r.id), intOrDash(r.ref), r.subject, textOrDash(r.status), textOrDash(r.assigned), textOrDash(r.project))
 	}
 
 	if len(rows) == limit {
@@ -1692,23 +1885,225 @@ func formatSearchResult(rows []searchRow, rawQuery string, limit int) (*mcp.Call
 	return textResult(b.String())
 }
 
+func (s *Server) searchProjects(ctx context.Context, q string, limit int) []searchRow {
+	query := url.Values{"page_size": []string{strconv.Itoa(SEARCH_FETCH_LIMIT)}}
+	data, _, err := s.client.ListJSON(ctx, "/projects", query, true)
+	if err != nil {
+		return nil
+	}
+
+	items, ok := data.([]any)
+	if !ok {
+		return nil
+	}
+
+	rows := make([]searchRow, 0, limit)
+	for _, item := range items {
+		if len(rows) >= limit {
+			break
+		}
+
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if !matchesProjectQuery(m, q) {
+			continue
+		}
+
+		rows = append(rows, searchRow{
+			kind:    "Projeto",
+			id:      displayInt(m["id"]),
+			subject: redactText(displayValue(m["name"])),
+			project: stringOrEmpty(m["slug"]),
+		})
+	}
+
+	return rows
+}
+
+func matchesProjectQuery(m map[string]any, q string) bool {
+	for _, key := range []string{"name", "slug", "description"} {
+		if strings.Contains(strings.ToLower(displayValue(m[key])), q) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) searchWiki(ctx context.Context, projectID int, text string, limit int) ([]searchRow, error) {
+	if projectID <= 0 {
+		return nil, errors.New("scope=wiki exige project_id")
+	}
+
+	query := url.Values{
+		"project": []string{strconv.Itoa(projectID)},
+		"text":    []string{text},
+	}
+
+	data, _, err := s.client.GetJSON(ctx, "/search", query)
+	if err != nil {
+		return nil, err
+	}
+
+	obj, ok := data.(map[string]any)
+	if !ok {
+		return nil, errors.New("resposta de busca do Taiga inválida")
+	}
+
+	items, ok := obj["wikipages"].([]any)
+	if !ok {
+		return nil, nil
+	}
+
+	rows := make([]searchRow, 0, limit)
+	for _, item := range items {
+		if len(rows) >= limit {
+			break
+		}
+
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		rows = append(rows, searchRow{
+			kind:    "Wiki",
+			id:      displayInt(m["id"]),
+			subject: redactText(firstString(m, "slug", "title", "name")),
+		})
+	}
+
+	return rows, nil
+}
+
+func (s *Server) searchComments(ctx context.Context, input SearchInput, q string, limit int) ([]searchRow, error) {
+	base := ""
+	itemID := 0
+
+	if input.CardID != nil {
+		base = "/userstories"
+		itemID = *input.CardID
+	}
+	if input.IssueID != nil {
+		base = "/issues"
+		itemID = *input.IssueID
+	}
+	if input.TaskID != nil {
+		base = "/tasks"
+		itemID = *input.TaskID
+	}
+
+	if itemID <= 0 {
+		return nil, errors.New("scope=comments exige card_id, issue_id ou task_id")
+	}
+
+	query := url.Values{"type": []string{"comment"}}
+	endpoint := fmt.Sprintf("/history/%s/%d", historyPath(base), itemID)
+	data, _, err := s.client.GetJSON(ctx, endpoint, query)
+	if err != nil {
+		return nil, err
+	}
+
+	items, ok := data.([]any)
+	if !ok {
+		return nil, nil
+	}
+
+	rows := make([]searchRow, 0, limit)
+	for _, item := range items {
+		if len(rows) >= limit {
+			break
+		}
+
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if historyHidden(m) {
+			continue
+		}
+
+		if commentDeleted(m) {
+			continue
+		}
+
+		text := displayValue(m["comment"])
+		if !strings.Contains(strings.ToLower(text), q) {
+			continue
+		}
+
+		rows = append(rows, searchRow{
+			kind:     "Comentário",
+			id:       displayInt(m["id"]),
+			subject:  redactText(snippet(text, SNIPPET_CHARS)),
+			assigned: redactName(resolveCommentAuthor(m)),
+		})
+	}
+
+	return rows, nil
+}
+
+func snippet(text string, max int) string {
+	value := strings.Join(strings.Fields(stripHTML(text)), " ")
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max]) + "…"
+}
+
 func (s *Server) search(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
-	q := strings.ToLower(strings.TrimSpace(input.Query))
+	raw := strings.TrimSpace(input.Query)
+	q := strings.ToLower(raw)
 	if q == "" {
 		return nil, nil, errors.New("'query' é obrigatório")
 	}
 
-	query := url.Values{}
+	projectID := 0
 	if input.ProjectID != nil {
 		if err := positive("project_id", *input.ProjectID); err != nil {
 			return nil, nil, err
 		}
-		query.Set("project", strconv.Itoa(*input.ProjectID))
+		projectID = *input.ProjectID
+	}
+
+	query := url.Values{}
+	if projectID > 0 {
+		query.Set("project", strconv.Itoa(projectID))
 	}
 
 	limit := searchLimit(input)
-	rows := s.searchBuckets(ctx, query, q, limit)
-	return formatSearchResult(rows, strings.TrimSpace(input.Query), limit)
+	scopes := searchScopes(input.Scope)
+	rows := s.searchBuckets(ctx, query, q, limit, scopes)
+
+	if scopeEnabled(scopes, "projects") {
+		rows = append(rows, s.searchProjects(ctx, q, limit)...)
+	}
+
+	if scopeEnabled(scopes, "wiki") {
+		wiki, err := s.searchWiki(ctx, projectID, raw, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		rows = append(rows, wiki...)
+	}
+
+	if scopeEnabled(scopes, "comments") {
+		comments, err := s.searchComments(ctx, input, q, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		rows = append(rows, comments...)
+	}
+
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+
+	return formatSearchResult(rows, raw, limit)
 }
 
 func (s *Server) listAttachments(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
@@ -1766,6 +2161,22 @@ func (s *Server) downloadAttachment(ctx context.Context, endpoint string, input 
 	return textResult(formatDownload(result))
 }
 
+func (s *Server) deleteAttachment(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
+	if !s.allowAct {
+		return nil, nil, errors.New("exclusão desativada: conceda TAIGA_ALLOW_ACT para liberar escritas")
+	}
+
+	if err := positive("attachment_id", input.AttachmentID); err != nil {
+		return nil, nil, err
+	}
+
+	if err := s.client.Delete(ctx, fmt.Sprintf("%s/attachments/%d", endpoint, input.AttachmentID), nil); err != nil {
+		return nil, nil, err
+	}
+
+	return textResult(fmt.Sprintf("🗑️ Anexo %d removido.", input.AttachmentID))
+}
+
 func (s *Server) uploadAttachment(ctx context.Context, endpoint string, input AttachmentInput) (*mcp.CallToolResult, any, error) {
 	if !s.allowAct {
 		return nil, nil, errors.New("upload desativado: conceda TAIGA_ALLOW_ACT para liberar escritas")
@@ -1819,8 +2230,10 @@ func (s *Server) attachment(ctx context.Context, _ *mcp.CallToolRequest, input A
 		return s.downloadAttachment(ctx, endpoint, input)
 	case "upload":
 		return s.uploadAttachment(ctx, endpoint, input)
+	case "delete":
+		return s.deleteAttachment(ctx, endpoint, input)
 	default:
-		return nil, nil, errors.New("action deve ser 'list', 'download' ou 'upload'")
+		return nil, nil, errors.New("action deve ser 'list', 'download', 'upload' ou 'delete'")
 	}
 }
 
@@ -2055,6 +2468,7 @@ func (s *Server) loadComments(ctx context.Context, kind string, id int) []commen
 		}
 
 		out = append(out, commentView{
+			id:     displayInt(m["id"]),
 			author: resolveCommentAuthor(m),
 			date:   displayValue(m["created_at"]),
 			text:   text,

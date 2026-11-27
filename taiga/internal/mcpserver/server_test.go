@@ -370,6 +370,212 @@ func TestCommentsHideDeleted(t *testing.T) {
 	}
 }
 
+func TestSearchScopes(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeText(t, w, `[{"id":7,"name":"Portal do Cliente","slug":"portal"}]`)
+		case "/api/v1/search":
+			writeText(t, w, `{"wikipages":[{"id":3,"slug":"onboarding-portal"}],"count":1}`)
+		default:
+			writeText(t, w, `[]`)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	projectID := 7
+	res, _, err := New(client).search(context.Background(), nil, SearchInput{
+		ProjectID: &projectID, Query: "portal", Scope: "projects,wiki",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+	for _, want := range []string{"Projeto", "Portal do Cliente", "Wiki", "onboarding-portal"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output sem %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestSearchComments(t *testing.T) {
+	gotQuery := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path != "/api/v1/history/userstory/55" {
+			t.Errorf("caminho inesperado: %s", r.URL.Path)
+			return
+		}
+
+		gotQuery = r.URL.Query().Get("type")
+		writeText(t, w, `[
+			{"id":11,"comment":"cliente pediu ajuste no portal","created_at":"2026-01-01T10:00:00Z","user":{"name":"Ana"}},
+			{"id":12,"comment":"nada a ver","created_at":"2026-01-02T10:00:00Z","user":{"name":"Ana"}},
+			{"id":13,"comment":"portal apagado","created_at":"2026-01-03T10:00:00Z","user":{"name":"Ana"},"delete_comment_date":"2026-01-04T10:00:00Z"}
+		]`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 55
+	res, _, err := New(client).search(context.Background(), nil, SearchInput{
+		Query: "portal", Scope: "comments", CardID: &cardID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotQuery != "comment" {
+		t.Errorf("type = %q, esperava comment", gotQuery)
+	}
+
+	text := resultText(t, res)
+	if !strings.Contains(text, "cliente pediu ajuste no portal") {
+		t.Errorf("output sem o comentário:\n%s", text)
+	}
+
+	if strings.Contains(text, "portal apagado") {
+		t.Errorf("output exibiu comentário apagado:\n%s", text)
+	}
+}
+
+func TestDeleteAttachment(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
+	gotMethod := ""
+	gotPath := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		gotMethod, gotPath = r.Method, r.URL.Path
+		writeText(t, w, `{}`)
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := New(client).attachment(context.Background(), nil, AttachmentInput{
+		Entity: "card", Action: "delete", AttachmentID: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %q", gotMethod)
+	}
+
+	if gotPath != "/api/v1/userstories/attachments/9" {
+		t.Errorf("path = %q", gotPath)
+	}
+
+	if !strings.Contains(resultText(t, res), "removido") {
+		t.Errorf("output sem confirmação")
+	}
+}
+
+func TestDeleteComment(t *testing.T) {
+	t.Setenv("TAIGA_ALLOW_ACT", "true")
+
+	gotPath := ""
+	gotID := ""
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/userstories/123":
+			writeText(t, w, `{"id":123,"ref":5,"subject":"Testar","version":3}`)
+		default:
+			gotPath = r.URL.Path
+			gotID = r.URL.Query().Get("id")
+			writeText(t, w, `{}`)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cardID := 123
+	commentID := 77
+	res, _, err := New(client).change(context.Background(), nil, ChangeInput{
+		Entity: "card", ItemID: &cardID, Action: "delete_comment", CommentID: &commentID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotPath != "/api/v1/history/userstory/123/delete_comment" {
+		t.Errorf("path = %q", gotPath)
+	}
+
+	if gotID != "77" {
+		t.Errorf("id = %q", gotID)
+	}
+
+	if !strings.Contains(resultText(t, res), "apagado") {
+		t.Errorf("output sem confirmação")
+	}
+}
+
+func TestActivityDateRange(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/userstories":
+			writeText(t, w, `[
+				{"id":1,"ref":1,"subject":"Antigo","modified_date":"2026-01-01T10:00:00Z","status_extra_info":{"name":"New"}},
+				{"id":2,"ref":2,"subject":"Recente","modified_date":"2026-01-20T10:00:00Z","status_extra_info":{"name":"New"}}
+			]`)
+		default:
+			writeText(t, w, `[]`)
+		}
+	}))
+	defer backend.Close()
+
+	client, err := taiga.NewClient(taiga.Config{BaseURL: backend.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := New(client).listActivity(context.Background(), ListActivityInput{
+		Since: "2026-01-15",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := resultText(t, res)
+	if !strings.Contains(text, "Recente") {
+		t.Errorf("output sem o item dentro do range:\n%s", text)
+	}
+
+	if strings.Contains(text, "Antigo") {
+		t.Errorf("output exibiu item fora do range:\n%s", text)
+	}
+}
+
 func TestChangeStatusCard(t *testing.T) {
 	t.Setenv("TAIGA_ALLOW_ACT", "true")
 

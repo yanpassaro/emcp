@@ -283,6 +283,70 @@ func (c *Client) PatchJSON(ctx context.Context, endpoint string, query url.Value
 	return result, responseMeta(resp), nil
 }
 
+func (c *Client) PostJSON(ctx context.Context, endpoint string, query url.Values, body any) (any, ResponseMeta, error) {
+	payload := []byte("{}")
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, ResponseMeta{}, fmt.Errorf("marshal POST body: %w", err)
+		}
+		payload = encoded
+	}
+
+	u := c.endpointURL(endpoint, query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("create Taiga POST request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", c.authorization())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, ResponseMeta{}, fmt.Errorf("request Taiga: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if !isSuccess(resp.StatusCode) {
+		return nil, ResponseMeta{}, fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
+	}
+
+	result := any(nil)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, MAX_JSON_RESPONSE_BYTES))
+	if err := decoder.Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, responseMeta(resp), nil
+		}
+		return nil, ResponseMeta{}, fmt.Errorf("decode Taiga response: %w", err)
+	}
+	return result, responseMeta(resp), nil
+}
+
+func (c *Client) Delete(ctx context.Context, endpoint string, query url.Values) error {
+	u := c.endpointURL(endpoint, query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create Taiga DELETE request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", c.authorization())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request Taiga: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if !isSuccess(resp.StatusCode) {
+		return fmt.Errorf("Taiga returned HTTP %d: %s", resp.StatusCode, errorMessage(resp))
+	}
+
+	return nil
+}
+
 func (c *Client) ListJSON(ctx context.Context, endpoint string, query url.Values, paginated bool) (any, ResponseMeta, error) {
 	headers := map[string]string{}
 	if !paginated {

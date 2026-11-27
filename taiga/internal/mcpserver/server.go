@@ -1772,7 +1772,7 @@ func (s *Server) uploadAttachment(ctx context.Context, endpoint string, input At
 
 	data, _, err := s.client.Upload(ctx, fmt.Sprintf("%s/attachments", endpoint), fields, "attached_file", path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("envio do anexo recusado (endpoint %s/attachments, campos enviados: object_id, project): %w", endpoint, err)
 	}
 
 	return textResult(formatUpload(path, size, data))
